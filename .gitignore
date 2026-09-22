@@ -35,3 +35,7 @@ src/utils/dependencies/XPose/models/UniPose/ops/dist
 src/utils/dependencies/XPose/models/UniPose/ops/MultiScaleDeformableAttention.egg-info
 
 .vscode
+
+# Neural conference outputs
+selftest_out/
+conference_*.png

@@ -1,0 +1,6 @@
+# Extra dependencies for webrtc_conference, on top of the LivePortrait base
+# requirements (requirements.txt / requirements_base.txt at the repo root).
+aiortc>=1.9.0
+aiohttp>=3.9
+encodec>=0.1.1
+sounddevice>=0.4.6
