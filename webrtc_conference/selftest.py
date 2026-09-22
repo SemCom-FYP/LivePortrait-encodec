@@ -289,6 +289,8 @@ async def stage_signaling(port: int):
 
     peers: dict[str, dict[str, NeuralPeer]] = {"alice": {}, "bob": {}}
     got_motion = asyncio.Event()
+    got_avatar: dict[str, bytes] = {}
+    avatar = bytes([0xFF, 0xD8]) + bytes(60000) + bytes([0xFF, 0xD9])   # stands in for the JPEG
 
     def make_client(tag: str, is_second: bool):
         sig = SignalingClient(url, "selftest", tag)
@@ -298,6 +300,11 @@ async def stage_signaling(port: int):
                 return peers[tag][pid]
             peer = NeuralPeer(pid, name, offerer, sig.signal, ice_servers=[])
             peer.on_motion = lambda p, pkt: got_motion.set()
+            peer.on_avatar = lambda p, data: got_avatar.__setitem__(tag, data)
+            # Greet exactly as client.py does: on the channels opening, not on
+            # the connection state, which runs a round trip too early.
+            peer.on_open = lambda p: (peer.send_ctrl({"type": "hello", "name": tag}),
+                                      peer.send_avatar(1, avatar))
             peers[tag][pid] = peer
             if offerer:
                 await peer.start_offer()
@@ -341,7 +348,16 @@ async def stage_signaling(port: int):
         check("mesh connection established via signaling", connected)
 
         if connected:
-            await asyncio.sleep(0.3)
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if len(got_avatar) == 2:
+                    break
+            # The avatar is sent once per peer, so this is the check that a
+            # participant shows up as a face rather than an empty tile.
+            check("both avatars arrived after the greeting",
+                  got_avatar.get("alice") == avatar and got_avatar.get("bob") == avatar,
+                  f"received {sorted(got_avatar)}")
+
             bob_peer = next(iter(peers["bob"].values()))
             bob_peer.send_motion(P.pack_motion(
                 0, 0, 1.0, 2.0, 3.0, 1.0,

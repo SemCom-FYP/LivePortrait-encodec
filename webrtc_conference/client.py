@@ -25,6 +25,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from aiortc import RTCIceServer
 
 from . import protocol as P
 from . import ui
@@ -33,7 +34,7 @@ from .media import (CameraReader, LatestSlot, MicReader, SpeakerMixer,
                     list_devices, probe_input_rate)
 from .motion_codec import (AvatarRenderer, LivePortraitEngine, MotionEncoder,
                            decode_avatar_jpeg, encode_avatar_jpeg, load_avatar_rgb)
-from .peer import NeuralPeer, RateMeter
+from .peer import DEFAULT_STUN, NeuralPeer, RateMeter, build_ice_servers
 from .signaling import DEFAULT_PORT, SignalingClient
 
 log = logging.getLogger("client")
@@ -72,6 +73,9 @@ class ConferenceApp:
         self._tx_audio = RateMeter()
         self._extract_ms = 0.0
         self._lock = threading.Lock()
+
+        self.ice_servers = _ice_servers(args)
+        print(f"  ICE: {_describe_ice(self.ice_servers)}")
 
         print("Loading LivePortrait networks …")
         self.engine = LivePortraitEngine(force_cpu=args.cpu)
@@ -315,32 +319,56 @@ class ConferenceApp:
                 return
             if state == "connected":
                 if r.renderer is None:
-                    r.status = "waiting for avatar…"
-                self._greet(pid)
+                    r.status = "opening channels…"
             elif state in ("failed", "closed", "disconnected"):
                 r.status = state
+
+        def on_open(pid):
+            r = self.remotes.get(pid)
+            if r is not None and r.renderer is None:
+                r.status = "waiting for avatar…"
+            self._greet(pid)
 
         peer.on_motion = on_motion
         peer.on_audio = on_audio
         peer.on_avatar = on_avatar
         peer.on_ctrl = on_ctrl
         peer.on_state = on_state
+        peer.on_open = on_open
         return remote
 
-    def _greet(self, peer_id: str):
+    def _greet(self, peer_id: str, attempt: int = 0):
+        """Send our name and portrait, once the channels can actually carry them.
+
+        The avatar goes out exactly once per peer, so a send that lands before
+        the channel opens is not a dropped frame — it is a participant who stays
+        a grey tile for the rest of the call. Hence the retry.
+        """
         peer = self.peers.get(peer_id)
-        if peer is None:
+        if peer is None or peer.closed:
+            return
+        if peer.ctrl.readyState != "open" or peer.blob.readyState != "open":
+            if attempt >= 40:                       # ~20 s
+                r = self.remotes.get(peer_id)
+                if r is not None:
+                    r.status = "channels never opened"
+                log.warning("[%s] giving up on the greeting: ctrl=%s blob=%s",
+                            peer.name, peer.ctrl.readyState, peer.blob.readyState)
+            elif self.loop is not None:
+                self.loop.call_later(0.5, self._greet, peer_id, attempt + 1)
             return
         peer.send_ctrl({"type": "hello", "name": self.args.name,
                         "client": "liveportrait-neural-conf",
                         "bandwidth": self.args.bandwidth})
         peer.send_avatar(1, self.avatar_jpeg)
+        log.info("[%s] sent hello + avatar (%.0f KiB)",
+                 peer.name, len(self.avatar_jpeg) / 1024)
 
     async def _add_peer(self, peer_id: str, name: str, is_offerer: bool):
         if peer_id in self.peers:
             return self.peers[peer_id]
         peer = NeuralPeer(peer_id, name, is_offerer, self.signaling.signal,
-                          ice_servers=self.args.stun)
+                          ice_servers=self.ice_servers)
         self.peers[peer_id] = peer
         self._attach_handlers(peer)
         if is_offerer:
@@ -491,6 +519,33 @@ class ConferenceApp:
             print("Left the room.")
 
 
+def _ice_servers(args):
+    """STUN URLs plus any TURN relay, which needs credentials alongside its URL.
+
+    On a network with client isolation — most campus and guest wifi — neither
+    host nor server-reflexive candidates are reachable and the call only works
+    through a relay, so TURN is not an exotic fallback there but the only path.
+    """
+    servers = [RTCIceServer(urls=u) for u in (args.stun or [])]
+    for url in (args.turn or []):
+        if not args.turn_user or not args.turn_pass:
+            log.warning("TURN server %s given without --turn-user/--turn-pass; "
+                        "almost every relay rejects anonymous allocations", url)
+        servers.append(RTCIceServer(urls=url, username=args.turn_user,
+                                    credential=args.turn_pass))
+    return build_ice_servers(servers)
+
+
+def _describe_ice(servers) -> str:
+    if not servers:
+        return "none (host candidates only — same-subnet, no isolation)"
+    parts = []
+    for s in servers:
+        urls = s.urls if isinstance(s.urls, str) else ", ".join(s.urls)
+        parts.append(f"{urls}{' (auth)' if s.username else ''}")
+    return "; ".join(parts)
+
+
 def _swallow(fn, *a):
     try:
         fn(*a)
@@ -506,8 +561,15 @@ def parse_args(argv=None):
     p.add_argument("--name", "-n", default=os.environ.get("USERNAME", "guest"))
     p.add_argument("--room", "-r", default="demo")
     p.add_argument("--signaling", default=f"ws://127.0.0.1:{DEFAULT_PORT}/ws")
-    p.add_argument("--stun", nargs="*", default=["stun:stun.l.google.com:19302"],
-                   help="STUN/TURN URLs (pass with no values to disable)")
+    p.add_argument("--stun", nargs="*", default=[DEFAULT_STUN],
+                   help="STUN URLs (pass with no values to disable)")
+    p.add_argument("--turn", nargs="*", default=[],
+                   help="TURN relay URLs, e.g. turn:host:3478 or turns:host:5349 "
+                        "(needed on networks with client isolation)")
+    p.add_argument("--turn-user", default=os.environ.get("TURN_USER"),
+                   help="TURN username (or set TURN_USER)")
+    p.add_argument("--turn-pass", default=os.environ.get("TURN_PASS"),
+                   help="TURN password (or set TURN_PASS)")
 
     g = p.add_argument_group("video")
     g.add_argument("--camera", "-c", type=int, default=0)

@@ -53,6 +53,11 @@ python -m webrtc_conference.client \
 A grid window opens with your own camera feed plus one re-synthesised tile per
 remote participant, each labelled with its live bitrate.
 
+Both clients on one machine can only share the webcam if they are told to use
+different ones — `cv2.VideoCapture` fails on the second, so pass `--camera 1`
+to the second client, or `--no-audio` and a second camera index when you just
+want to watch the mesh come up.
+
 | key | action |
 |-----|--------|
 | `q` / `Esc` | leave the call |
@@ -175,5 +180,19 @@ Things worth knowing before relying on this:
 - **`KMP_DUPLICATE_LIB_OK`** is set in `__init__.py`: onnxruntime and torch each
   ship an Intel OpenMP runtime and on Windows the second to load aborts the
   process.
-- **No TURN by default.** Peers behind symmetric NATs need one; pass it via
-  `--stun`, which accepts TURN URLs too.
+- **No TURN by default.** Only a STUN server is configured, which is enough for
+  most home NATs. A relay is needed when the two peers cannot reach each other
+  directly at all — symmetric NAT, and, more commonly, **wifi with client
+  isolation**, which most campus and guest networks enable. There neither host
+  nor server-reflexive candidates are usable and the call only connects through
+  TURN:
+
+  ```bash
+  python -m webrtc_conference.client ...       --turn turn:relay.example.org:3478       --turn-user USER --turn-pass SECRET
+  ```
+
+  Credentials are required: TURN URLs alone will not authenticate. `TURN_USER`
+  and `TURN_PASS` work instead of the flags. To test whether your network needs
+  this, see if the two machines can reach each other directly at all — serve the
+  signaling server on the LAN and open `http://<host>:8765/rooms` from the other
+  machine. If that fails, client isolation is on and TURN is mandatory.

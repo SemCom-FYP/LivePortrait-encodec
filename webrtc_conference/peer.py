@@ -36,6 +36,31 @@ AUDIO_LIFETIME_MS = 300
 MOTION_BACKPRESSURE_BYTES = 64 * 1024
 
 
+DEFAULT_STUN = "stun:stun.l.google.com:19302"
+
+
+def build_ice_servers(servers) -> list[RTCIceServer]:
+    """Normalise an ICE server list.
+
+    `None` means "caller expressed no opinion" and gets the default STUN server;
+    an empty list means "no servers at all", which is what loopback and a LAN
+    without isolation want. Entries may be plain URL strings or ready-made
+    :class:`RTCIceServer` objects — TURN needs the latter, since a URL alone
+    cannot carry the credentials TURN authentication requires.
+    """
+    if servers is None:
+        servers = [DEFAULT_STUN]
+    out = []
+    for server in servers:
+        if isinstance(server, RTCIceServer):
+            out.append(server)
+        elif isinstance(server, dict):
+            out.append(RTCIceServer(**server))
+        else:
+            out.append(RTCIceServer(urls=server))
+    return out
+
+
 class RateMeter:
     """Sliding-window byte/packet rate, so the HUD shows now rather than
     an average dragged down by model loading at startup."""
@@ -104,10 +129,8 @@ class NeuralPeer:
         self.connected = asyncio.Event()
         self.closed = False
 
-        config = RTCConfiguration(iceServers=[
-            RTCIceServer(urls=u) for u in (ice_servers or ["stun:stun.l.google.com:19302"])
-        ])
-        self.pc = RTCPeerConnection(configuration=config)
+        self.pc = RTCPeerConnection(
+            configuration=RTCConfiguration(iceServers=build_ice_servers(ice_servers)))
 
         self.ctrl = self.pc.createDataChannel(
             "ctrl", negotiated=True, id=CH_CTRL, ordered=True)
@@ -125,8 +148,10 @@ class NeuralPeer:
         self.on_avatar: Callable[[str, bytes], None] = lambda pid, data: None
         self.on_ctrl: Callable[[str, dict], None] = lambda pid, msg: None
         self.on_state: Callable[[str, str], None] = lambda pid, state: None
+        self.on_open: Callable[[str], None] = lambda pid: None
 
         self._reassembler = P.BlobReassembler()
+        self._channels_open = False
         self._wire_channels()
 
         @self.pc.on("connectionstatechange")
@@ -139,7 +164,19 @@ class NeuralPeer:
             elif state in ("failed", "closed"):
                 self.connected.clear()
 
+    @property
+    def channels(self):
+        return (self.ctrl, self.blob, self.motion, self.audio)
+
     def _wire_channels(self):
+        # The channels are negotiated out-of-band, so they all flip to "open"
+        # together once the SCTP association is established — which is strictly
+        # after connectionState reports "connected" (that fires on DTLS, one
+        # round trip earlier). Anything sent in between is dropped on the floor,
+        # so the application waits for this event, not for the state change.
+        for channel in self.channels:
+            channel.on("open", self._maybe_open)
+
         @self.ctrl.on("message")
         def _ctrl(message):
             if isinstance(message, str):
@@ -182,6 +219,13 @@ class NeuralPeer:
                 return
             self.stats_rx.add_audio(len(message))
             self.on_audio(self.peer_id, pkt)
+
+    def _maybe_open(self):
+        if self._channels_open or any(c.readyState != "open" for c in self.channels):
+            return
+        self._channels_open = True
+        log.info("[%s] datachannels open", self.name)
+        self.on_open(self.peer_id)
 
     # ── negotiation ──────────────────────────────────────────────────────────
 
