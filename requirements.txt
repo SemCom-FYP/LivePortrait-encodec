@@ -1,4 +1,9 @@
 -r requirements_base.txt
 
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
+
 onnxruntime-gpu==1.18.0
 transformers==4.38.0
