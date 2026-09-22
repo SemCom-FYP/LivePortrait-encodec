@@ -18,6 +18,9 @@ pretrained_weights/insightface
 # Ipython notebook
 *.ipynb
 
+
+.venv
+
 # Temporary files or benchmark resources
 animations/*
 tmp/*
