@@ -5,10 +5,12 @@ End-to-end verification without a second machine, camera or microphone.
     python -m webrtc_conference.selftest
 
 Stage 1  wire format round-trips
-Stage 2  EnCodec encode -> pack -> unpack -> decode on synthetic speech
-Stage 3  LivePortrait motion extract -> pack -> unpack -> render
-Stage 4  two real aiortc peers over loopback, exchanging an avatar, a burst of
+Stage 2  A/V sync: a whole call stepped through the playout buffer
+Stage 3  EnCodec encode -> pack -> unpack -> decode on synthetic speech
+Stage 4  LivePortrait motion extract -> pack -> unpack -> render
+Stage 5  two real aiortc peers over loopback, exchanging an avatar, a burst of
          motion vectors and a burst of audio through the actual datachannels
+Stage 6  two clients meeting through the real signaling server
 """
 
 import argparse
@@ -22,6 +24,7 @@ import numpy as np
 
 from . import protocol as P
 from .audio_codec import SAMPLE_RATE, EncodecStreamCodec
+from .media import AVSync, MotionJitterBuffer
 from .motion_codec import (AvatarRenderer, LivePortraitEngine, MotionEncoder,
                            decode_avatar_jpeg, encode_avatar_jpeg, load_avatar_rgb)
 from .peer import NeuralPeer
@@ -56,9 +59,10 @@ def stage_protocol():
           f"max {np.abs(m.exp - exp).max():.2e}")
 
     codes = rng.integers(0, 1024, size=(8, 18))
-    packed = P.pack_audio(5, codes)
+    packed = P.pack_audio(5, 999, codes)
     ap = P.unpack_audio(packed)
     check("10-bit code packing is lossless", np.array_equal(ap.codes, codes))
+    check("audio header survives", ap.seq == 5 and ap.t_ms == 999)
     check("audio payload size matches formula",
           len(packed) == P.audio_payload_size(8, 18), f"{len(packed)} B")
 
@@ -71,8 +75,97 @@ def stage_protocol():
 
 # ── stage 2 ───────────────────────────────────────────────────────────────────
 
+def _motion_at(seq: int, t_ms: int) -> P.MotionPacket:
+    return P.unpack_motion(P.pack_motion(
+        seq, t_ms, 0.0, 0.0, 0.0, 1.0,
+        np.zeros(3, np.float32), np.zeros((21, 3), np.float32)))
+
+
+def _drain(base_ms: int, head_start_ms: float, slack_ms: float = 10.0,
+           fps: int = 20, seconds: float = 3.0, net_ms: float = 60.0):
+    """Steps a whole call through the buffer against a synthetic playhead and
+    reports what a viewer would have seen. Deterministic: no clocks, no sleeps.
+    """
+    buf = MotionJitterBuffer()
+    period = 1000.0 / fps
+    n = int(seconds * fps)
+    arrivals = [(i * period + net_ms, (base_ms + int(i * period)) & 0xFFFFFFFF)
+                for i in range(n)]
+    released, errors = [], []
+    wall = 0.0
+    while wall < seconds * 1000 + 500:
+        while arrivals and arrivals[0][0] <= wall:
+            buf.put(_motion_at(0, arrivals.pop(0)[1]))
+        # The audio path runs head_start_ms behind the video that came with it.
+        playhead = int(base_ms + wall - net_ms - head_start_ms) & 0xFFFFFFFF
+        pkt = buf.take_due(playhead, slack_ms)
+        if pkt is not None:
+            released.append(pkt.t_ms)
+            errors.append(P.diff_t_ms(pkt.t_ms, playhead))
+        wall += 5.0
+    return n, released, errors
+
+
+def stage_sync():
+    """A/V sync timing, which is pure arithmetic and needs no hardware."""
+    print("\nStage 2: A/V sync")
+
+    sync = AVSync()
+    check("no playhead before the peer's audio starts",
+          sync.playhead_t_ms() is None)
+    sync.note_audio_push(100_000, 50.0)         # audible 50 ms from now
+    start = sync.playhead_t_ms()
+    time.sleep(0.02)
+    moved = sync.playhead_t_ms() - start
+    check("playhead sits behind by what is still queued",
+          abs(start - (100_000 - 50)) < 5, f"{start - 100_000:+.1f} ms of 100000")
+    check("playhead advances with real time", 15 < moved < 30,
+          f"{moved:+.1f} ms over a 20 ms sleep")
+
+    # The regression that matters. Video always arrives a long way ahead of the
+    # audio it belongs with, so a buffer that keeps only the newest packet and
+    # waits for it to come due never renders anything at all: every packet is
+    # replaced before its turn. Nothing here may freeze.
+    for head_start in (0.0, 120.0, 300.0, 600.0):
+        n, released, errors = _drain(1_000_000, head_start)
+        check(f"video keeps flowing {head_start:.0f} ms behind the audio",
+              len(released) >= n * 0.95, f"{len(released)}/{n} frames")
+        check(f"  and lands in sync at {head_start:.0f} ms",
+              errors and max(errors) <= 10 and min(errors) > -60,
+              f"error {min(errors):+.0f}..{max(errors):+.0f} ms")
+        check(f"  in capture order at {head_start:.0f} ms",
+              all(P.diff_t_ms(b, a) > 0 for a, b in zip(released, released[1:])))
+
+    # Same call, but with the sender's 32-bit millisecond clock about to wrap.
+    n, wrapped, errors = _drain((2 ** 32) - 1500, 300.0)
+    check("the 2**32 ms timestamp wrap is not a stall",
+          len(wrapped) >= n * 0.95 and max(errors) <= 10,
+          f"{len(wrapped)}/{n} frames, error up to {max(errors):+.0f} ms")
+
+    # A peer with no audio yet has no clock to sync against, so video must run
+    # at arrival rather than wait for a playhead that will never come.
+    buf = MotionJitterBuffer()
+    for i in range(5):
+        buf.put(_motion_at(i, 5000 + i * 50))
+    free = buf.take_due(None, 10.0)
+    check("video runs free while a peer sends no audio",
+          free is not None and free.t_ms == 5200 and buf.take_due(None, 10.0) is None,
+          "newest released, queue emptied")
+
+    # The motion channel is unordered, so a packet can arrive after a newer one
+    # has already been shown; replaying it would jerk the face backwards.
+    buf = MotionJitterBuffer()
+    buf.put(_motion_at(1, 9000))
+    check("a newer packet is released", buf.take_due(9000, 10.0).t_ms == 9000)
+    buf.put(_motion_at(0, 8950))                # reordered, already overtaken
+    check("a reordered straggler is dropped, not replayed",
+          buf.take_due(9000, 10.0) is None)
+
+
+# ── stage 3 ───────────────────────────────────────────────────────────────────
+
 def stage_audio(bandwidth: float, chunk_ms: int, device: str):
-    print(f"\nStage 2: EnCodec  (bandwidth={bandwidth} kbps, chunk={chunk_ms} ms)")
+    print(f"\nStage 3: EnCodec  (bandwidth={bandwidth} kbps, chunk={chunk_ms} ms)")
     codec = EncodecStreamCodec(bandwidth=bandwidth, device=device, chunk_ms=chunk_ms)
     check("quantiser configured", codec.n_q > 0,
           f"n_q={codec.n_q}, nominal {codec.nominal_kbps:.1f} kbps")
@@ -86,7 +179,7 @@ def stage_audio(bandwidth: float, chunk_ms: int, device: str):
     sizes, enc_ms, dec_ms = [], [], []
     for i in range(5):
         codes = codec.encode(speechy, mic_sr)
-        wire = P.pack_audio(i, codes)
+        wire = P.pack_audio(i, i * chunk_ms, codes)
         pcm = codec.decode(P.unpack_audio(wire).codes)
         sizes.append(len(wire))
         enc_ms.append(codec.stats.encode_ms)
@@ -105,10 +198,10 @@ def stage_audio(bandwidth: float, chunk_ms: int, device: str):
           f"peak {np.abs(pcm).max():.3f}")
 
 
-# ── stage 3 ───────────────────────────────────────────────────────────────────
+# ── stage 4 ───────────────────────────────────────────────────────────────────
 
 def stage_video(source: str, driving: str, out_dir: str, cpu: bool):
-    print("\nStage 3: LivePortrait motion codec")
+    print("\nStage 4: LivePortrait motion codec")
     engine = LivePortraitEngine(force_cpu=cpu)
     print(f"  device: {engine.device}")
 
@@ -176,10 +269,10 @@ def stage_video(source: str, driving: str, out_dir: str, cpu: bool):
           f"({P.MOTION_PACKET_SIZE} B/frame)")
 
 
-# ── stage 4 ───────────────────────────────────────────────────────────────────
+# ── stage 5 ───────────────────────────────────────────────────────────────────
 
 async def stage_transport(source: str):
-    print("\nStage 4: aiortc loopback over real datachannels")
+    print("\nStage 5: aiortc loopback over real datachannels")
     a_to_b: asyncio.Queue = asyncio.Queue()
     b_to_a: asyncio.Queue = asyncio.Queue()
     received = {"avatar": None, "motion": [], "audio": [], "ctrl": []}
@@ -240,7 +333,7 @@ async def stage_transport(source: str):
             calibrate=(i == 0)))
         if i % 5 == 0:
             alice.send_audio(P.pack_audio(
-                i // 5, rng.integers(0, 1024, size=(8, 18))))
+                i // 5, i * 50, rng.integers(0, 1024, size=(8, 18))))
         await asyncio.sleep(0.01)
 
     for _ in range(50):
@@ -271,11 +364,11 @@ async def stage_transport(source: str):
     await bob.close()
 
 
-# ── stage 5 ───────────────────────────────────────────────────────────────────
+# ── stage 6 ───────────────────────────────────────────────────────────────────
 
 async def stage_signaling(port: int):
     """Two clients meeting through the real signaling server, as client.py does."""
-    print("\nStage 5: room signaling and mesh setup")
+    print("\nStage 6: room signaling and mesh setup")
     from aiohttp import web
 
     from .signaling import SignalingClient, SignalingServer
@@ -391,12 +484,15 @@ def main(argv=None):
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--out", default="selftest_out")
     p.add_argument("--skip", nargs="*", default=[],
-                   choices=["protocol", "audio", "video", "transport", "signaling"])
+                   choices=["protocol", "sync", "audio", "video", "transport",
+                            "signaling"])
     p.add_argument("--signaling-port", type=int, default=8799)
     args = p.parse_args(argv)
 
     if "protocol" not in args.skip:
         stage_protocol()
+    if "sync" not in args.skip:
+        stage_sync()
     if "audio" not in args.skip:
         stage_audio(args.bandwidth, args.audio_chunk_ms, args.audio_device)
     if "video" not in args.skip:

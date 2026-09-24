@@ -9,6 +9,11 @@ Threading: aiortc owns an asyncio loop on a background thread; OpenCV owns the
 main thread. Torch work never touches the loop — capture, motion extraction,
 rendering and audio coding each run on their own thread and hand finished
 buffers across with `call_soon_threadsafe` or a one-deep mailbox.
+
+A/V sync: audio is the master clock, because the speaker drains at a rate we
+do not control. Motion and audio both carry the sender's capture timestamp,
+and motion waits in a per-peer queue until the instant it was captured comes
+up on that peer's audio playhead — see AVSync and MotionJitterBuffer.
 """
 
 import argparse
@@ -30,14 +35,22 @@ from aiortc import RTCIceServer
 from . import protocol as P
 from . import ui
 from .audio_codec import SAMPLE_RATE, CrossfadeJoiner, EncodecStreamCodec
-from .media import (CameraReader, LatestSlot, MicReader, SpeakerMixer,
-                    list_devices, probe_input_rate)
+from .media import (AVSync, CameraReader, LatestSlot, MicReader,
+                    MotionJitterBuffer, SpeakerMixer, list_devices,
+                    probe_input_rate)
 from .motion_codec import (AvatarRenderer, LivePortraitEngine, MotionEncoder,
                            decode_avatar_jpeg, encode_avatar_jpeg, load_avatar_rgb)
 from .peer import DEFAULT_STUN, NeuralPeer, RateMeter, build_ice_servers
 from .signaling import DEFAULT_PORT, SignalingClient
 
 log = logging.getLogger("client")
+
+# How far ahead of the audio playhead a motion packet may be and still be
+# rendered now instead of waiting another tick. Kept small because it lands
+# entirely on the leading side, and video that runs ahead of a voice is far
+# more noticeable than video that trails it (ITU-R BT.1359 puts the bounds at
+# roughly +45 ms against -125 ms).
+AV_SYNC_SLACK_MS = 10
 
 
 @dataclass
@@ -48,9 +61,11 @@ class RemoteState:
     renderer: Optional[AvatarRenderer] = None
     avatar_jpeg: Optional[bytes] = None
     status: str = "connecting…"
-    pending_motion: LatestSlot = field(default_factory=LatestSlot)
+    pending_motion: MotionJitterBuffer = field(default_factory=MotionJitterBuffer)
     audio_q: "queue.Queue[P.AudioPacket]" = field(default_factory=lambda: queue.Queue(maxsize=8))
     joiner: CrossfadeJoiner = field(default_factory=CrossfadeJoiner)
+    av_sync: AVSync = field(default_factory=AVSync)
+    sync_drift_ms: float = 0.0
     frames_rendered: int = 0
     render_ms: float = 0.0
     last_seq: int = -1
@@ -100,7 +115,7 @@ class ConferenceApp:
         self.audio_codec: Optional[EncodecStreamCodec] = None
         self.speaker: Optional[SpeakerMixer] = None
         self.mic: Optional[MicReader] = None
-        self._mic_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+        self._mic_q: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue(maxsize=4)
         if not args.no_audio:
             print(f"  loading EnCodec ({args.bandwidth} kbps, {args.audio_device}) …")
             self.audio_codec = EncodecStreamCodec(
@@ -145,6 +160,11 @@ class ConferenceApp:
             if frame is None:
                 continue
 
+            # Stamped at the grab, not after extraction: the timestamp has to
+            # mark when the pose happened, or the far side lines its render up
+            # against our extraction time and the face trails the voice.
+            cap_t_ms = int(time.monotonic() * 1000) & 0xFFFFFFFF
+
             t0 = time.perf_counter()
             state = self.encoder.extract(frame)
             self._extract_ms = (time.perf_counter() - t0) * 1000
@@ -155,7 +175,7 @@ class ConferenceApp:
             calibrate = self._calibrate_next
             self._calibrate_next = False
             payload = P.pack_motion(
-                self._motion_seq, int(time.monotonic() * 1000) & 0xFFFFFFFF,
+                self._motion_seq, cap_t_ms,
                 state.pitch, state.yaw, state.roll, state.scale, state.t, state.exp,
                 calibrate=calibrate)
             self._motion_seq += 1
@@ -180,15 +200,22 @@ class ConferenceApp:
             self.loop.call_soon_threadsafe(_swallow, peer.send_motion, payload)
 
     def _on_mic_chunk(self, pcm: np.ndarray):
+        # The callback only fires once the whole block has been captured, so
+        # "now" is the *end* of the window. The wire timestamp marks the first
+        # sample instead, which is the one the far side hears first — stamping
+        # it "now" would hand every chunk to the receiver a whole chunk late
+        # and let video run that far ahead of the voice.
+        span_ms = pcm.size / self.mic.sample_rate * 1000
+        t_ms = int(time.monotonic() * 1000 - span_ms) & 0xFFFFFFFF
         try:
-            self._mic_q.put_nowait(pcm)
+            self._mic_q.put_nowait((t_ms, pcm))
         except queue.Full:
             pass                                    # mic outran the encoder; drop
 
     def _audio_encode_loop(self):
         while self.running:
             try:
-                pcm = self._mic_q.get(timeout=0.25)
+                t_ms, pcm = self._mic_q.get(timeout=0.25)
             except queue.Empty:
                 continue
             try:
@@ -196,7 +223,7 @@ class ConferenceApp:
             except Exception as exc:
                 log.warning("audio encode failed: %s", exc)
                 continue
-            payload = P.pack_audio(self._audio_seq, codes)
+            payload = P.pack_audio(self._audio_seq, t_ms, codes)
             self._audio_seq += 1
             self._tx_audio.add(len(payload))
             if self.loop is not None:
@@ -217,6 +244,12 @@ class ConferenceApp:
                 except Exception as exc:
                     log.debug("audio decode failed: %s", exc)
                     continue
+                # Measured before the push, so it counts only what has to play
+                # out first; the device's own buffering sits behind that again
+                # and is large enough on Windows to matter for lip sync.
+                delay_ms = (self.speaker.backlog_ms(remote.peer_id)
+                            + self.speaker.output_latency_ms)
+                remote.av_sync.note_audio_push(pkt.t_ms, delay_ms)
                 self.speaker.push(remote.peer_id, remote.joiner.push(pcm))
             if not work:
                 time.sleep(0.005)
@@ -226,9 +259,17 @@ class ConferenceApp:
 
         Warp+decode is the most expensive step in the whole system and it runs
         once per participant on screen, so peers take strict turns. Each one
-        renders only its newest vector; anything that arrived while the GPU was
-        busy elsewhere is dropped rather than queued, which keeps latency flat
-        as the room grows instead of letting a backlog build.
+        renders a single vector per turn and everything the GPU missed while it
+        was busy elsewhere is discarded, so a slow GPU costs frames rather than
+        building a backlog and letting latency grow with the room.
+
+        Which vector that is comes from the peer's audio playhead rather than
+        from arrival order: the buffer hands back the newest packet whose
+        capture instant has actually reached the speaker, so lip motion lands
+        with the voice instead of a chunk ahead of it. The pick aims at where
+        the playhead will be once this render finishes rather than where it is
+        now — on CPU a warp costs more than a hundred milliseconds, which is
+        the difference between lip sync and a face a beat behind the voice.
         """
         min_period = 1.0 / self.args.max_render_fps if self.args.max_render_fps else 0.0
         last_render: dict[str, float] = {}
@@ -240,7 +281,9 @@ class ConferenceApp:
                 now = time.perf_counter()
                 if now - last_render.get(remote.peer_id, 0.0) < min_period:
                     continue
-                pkt = remote.pending_motion.take()
+                playhead = remote.av_sync.playhead_t_ms()
+                pkt = remote.pending_motion.take_due(
+                    playhead, AV_SYNC_SLACK_MS + remote.render_ms)
                 if pkt is None:
                     continue
                 work = True
@@ -252,6 +295,11 @@ class ConferenceApp:
                     continue
                 remote.render_ms = (time.perf_counter() - now) * 1000
                 remote.frames_rendered += 1
+                # Read again now the frame is actually on screen: this is the
+                # error a viewer would see, not the one we aimed for.
+                shown = remote.av_sync.playhead_t_ms()
+                if shown is not None:
+                    remote.sync_drift_ms = P.diff_t_ms(pkt.t_ms, int(shown))
             if not work:
                 time.sleep(0.003)
 
@@ -489,8 +537,11 @@ class ConferenceApp:
 
         if peer is not None:
             v_kbps, a_kbps = peer.stats_rx.kbps()
+            have_sync = remote.av_sync.playhead_t_ms() is not None
+            sync = f"{remote.sync_drift_ms:+.0f} ms" if have_sync else "n/a"
             subtitle = (f"video {v_kbps:5.1f} kbps   audio {a_kbps:4.1f} kbps   "
-                        f"render {remote.render_ms:.0f} ms   lost {remote.lost}")
+                        f"render {remote.render_ms:.0f} ms   lost {remote.lost}   "
+                        f"a/v sync {sync}")
         else:
             subtitle = ""
         return ui.Tile(title=remote.name, image=image, subtitle=subtitle,

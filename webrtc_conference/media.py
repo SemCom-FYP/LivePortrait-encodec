@@ -1,12 +1,22 @@
 # coding: utf-8
-"""Local capture and playback devices, all non-blocking with respect to callers."""
+"""Local capture and playback devices, plus the playout timing built on them.
+
+All of it is non-blocking with respect to callers. The A/V sync pieces live
+here rather than in the client because they are defined by the speaker: it is
+SpeakerMixer's drain rate that says when a sample becomes audible, and that is
+the clock everything else is scheduled against.
+"""
 
 import queue
 import threading
+import time
+from collections import deque
 from typing import Callable, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from . import protocol as P
 
 try:
     import sounddevice as sd
@@ -130,6 +140,16 @@ class SpeakerMixer:
             buf = self._buffers.get(peer_id)
         return 0.0 if buf is None else buf.size / self.sample_rate * 1000
 
+    @property
+    def output_latency_ms(self) -> float:
+        """What the device holds behind our own buffer. MME and shared-mode
+        WASAPI report tens of milliseconds here, which is the difference
+        between lip sync landing and being visibly early."""
+        try:
+            return float(self._stream.latency) * 1000
+        except Exception:
+            return 0.0
+
     def start(self):
         self._stream.start()
 
@@ -160,6 +180,93 @@ class LatestSlot:
     def peek(self):
         with self._lock:
             return self._item
+
+
+class AVSync:
+    """Tracks where in a remote's capture timeline their audio is playing.
+
+    Motion and audio packets from a given peer are both stamped with that
+    peer's `time.monotonic()` clock, so the two are directly comparable even
+    though we never negotiate clocks with them. The speaker drains each
+    peer's ring buffer at a fixed sample rate, so whatever is queued for that
+    peer is a countdown to when the chunk we are about to add actually
+    becomes audible; anchoring the chunk's capture timestamp to that moment
+    turns the pair into a live estimate of which capture instant is coming
+    out of the speaker right now.
+
+    Re-anchoring on every chunk is what keeps this honest: it costs nothing
+    and it absorbs codec padding, mixer underruns and clock drift between
+    the two machines, none of which can then accumulate.
+    """
+
+    def __init__(self):
+        # One tuple, so the render and UI threads can never read a new
+        # timestamp against a stale anchor.
+        self._anchor: Optional[Tuple[int, float]] = None
+
+    def note_audio_push(self, t_ms: int, delay_ms: float) -> None:
+        """Audio captured at `t_ms` becomes audible `delay_ms` from now."""
+        self._anchor = (t_ms, time.perf_counter() + delay_ms / 1000.0)
+
+    def playhead_t_ms(self) -> Optional[float]:
+        """Sender-clock instant the speaker is presenting right now, or None
+        before any audio has been played for this peer."""
+        anchor = self._anchor
+        if anchor is None:
+            return None
+        t_ms, audible_at = anchor
+        return t_ms + (time.perf_counter() - audible_at) * 1000.0
+
+
+class MotionJitterBuffer:
+    """Motion packets waiting for their moment on the peer's audio playhead.
+
+    Video has to queue here rather than sit in a one-deep mailbox. Motion
+    arrives well ahead of the audio it belongs with — the sender's voice is
+    still being gathered into a chunk and encoded while the pose that made it
+    is already on the wire — so keeping only the newest packet and rendering
+    it once due would never render at all: the wait is longer than the gap
+    between packets, so each one is replaced before its turn comes. Queueing
+    them lets the buffer fill to whatever head start the audio path has and
+    then drain at capture cadence.
+
+    Late packets are still dropped, just at the far end: when the playhead
+    passes several at once only the newest of them is rendered, which keeps
+    the old "never build a backlog on the GPU" behaviour intact.
+    """
+
+    def __init__(self, maxlen: int = 90):
+        self._q: "deque[P.MotionPacket]" = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._released_t_ms: Optional[int] = None
+
+    def put(self, pkt: P.MotionPacket) -> None:
+        with self._lock:
+            if (self._released_t_ms is not None
+                    and P.diff_t_ms(pkt.t_ms, self._released_t_ms) <= 0):
+                return          # unordered channel reordered it past its slot
+            self._q.append(pkt)             # maxlen drops the oldest if we stall
+
+    def take_due(self, playhead_t_ms: Optional[float],
+                 slack_ms: float) -> Optional[P.MotionPacket]:
+        """The newest packet the playhead has reached, or None while the whole
+        queue is still in the peer's future. Without a playhead — a peer with
+        no audio yet — the newest packet is always due."""
+        with self._lock:
+            due = None
+            if playhead_t_ms is None:
+                if self._q:
+                    due = self._q[-1]
+                self._q.clear()
+            else:
+                mark = int(playhead_t_ms)
+                while self._q and P.diff_t_ms(self._q[0].t_ms, mark) <= slack_ms:
+                    pkt = self._q.popleft()
+                    if due is None or P.diff_t_ms(pkt.t_ms, due.t_ms) > 0:
+                        due = pkt
+            if due is not None:
+                self._released_t_ms = due.t_ms
+            return due
 
 
 def _is_windows() -> bool:

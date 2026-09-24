@@ -6,7 +6,7 @@ audio nor video uses a conventional codec:
 | stream | what actually travels | measured rate |
 |--------|----------------------|---------------|
 | video  | LivePortrait implicit-keypoint motion vectors, 150 B/frame | **~17 kbps** at 14 fps, 24 kbps at 20 fps |
-| audio  | EnCodec 24 kHz residual-VQ codes, bit-packed at 10 bits/entry | **~6.2 kbps** |
+| audio  | EnCodec 24 kHz residual-VQ codes, bit-packed at 10 bits/entry | **~6.4 kbps** |
 
 For comparison, H.264 at 640×480/25 fps in a conferencing configuration is
 typically budgeted around 460 kbps. The whole call — both directions of one
@@ -16,6 +16,10 @@ The trick is that pixels are never transmitted. Each participant sends a
 portrait of themselves **once** at call setup (~67 KiB of JPEG), and from then
 on sends only what their face is *doing*. Every receiver re-synthesises them
 locally with LivePortrait's warping and generator networks.
+
+[PIPELINE.md](PIPELINE.md) walks the whole path end to end: how WebRTC is used,
+how features become packets, quantisation, the audio codec, transmission, A/V
+synchronisation, and how all of it differs from standard WebRTC.
 
 ## Install
 
@@ -75,10 +79,11 @@ Useful flags: `--fps` (motion vectors per second), `--bandwidth`
 python -m webrtc_conference.selftest
 ```
 
-Five stages: wire format round-trips, EnCodec encode→decode, LivePortrait
-extract→render (writes `selftest_out/selftest_video.png` showing
-*source | driving crop | reconstruction*), two real aiortc peers over loopback,
-and two clients meeting through the actual signaling server.
+Six stages: wire format round-trips, A/V sync timing (pure arithmetic, no
+hardware), EnCodec encode→decode, LivePortrait extract→render (writes
+`selftest_out/selftest_video.png` showing *source | driving crop |
+reconstruction*), two real aiortc peers over loopback, and two clients meeting
+through the actual signaling server.
 
 ## How it works
 
@@ -113,9 +118,10 @@ expression deltas    21×3    int16, 1/16384
                        70 × 2 B  + 10 B header  = 150 B
 ```
 
-Fixed-point rather than float16: the expression deltas live around 1e-2, where
-float16's relative mantissa is coarser than a flat 6e-5 step. Round-trip error
-is under 1e-4 (checked in stage 1 of the self-test).
+Fixed-point rather than float16 because of the worst case, not the typical one:
+a float16 step grows with magnitude, reaching 2e-3 near the ends of the
+expression range, where a flat 6.1e-5 step holds everywhere. Round-trip error is
+under 1e-4 (checked in stage 1 of the self-test).
 
 The receiver already paid the expensive one-time costs when the avatar arrived —
 the appearance volume `f_s` from **F** and the transformed source keypoints
@@ -136,15 +142,17 @@ the corresponding latent frames — the convolution stack sees real context at t
 boundary instead of zero padding — and the decoder crossfades 5 ms across joins.
 
 Codes go out as a dense 10-bit bitstream rather than one `uint16` per entry,
-which is what keeps the wire rate (6.23 kbps) at the model's nominal 6.0.
+which is what keeps the wire rate (6.37 kbps, the rest being the 11-byte header
+that carries the capture timestamp) close to the model's nominal 6.0.
 
 ### Threading
 
 aiortc owns an asyncio loop on a background thread; OpenCV owns the main thread.
 Torch never runs on the loop. Capture, motion extraction, rendering and audio
 coding each have their own thread and hand finished buffers across with
-`call_soon_threadsafe` or a one-deep mailbox that drops stale frames instead of
-queueing them.
+`call_soon_threadsafe` or a one-deep mailbox. Incoming motion is the exception:
+it waits in a per-peer playout queue until that peer's audio playhead reaches its
+capture timestamp, which is what keeps lips on the voice.
 
 ## Performance and limits
 
@@ -159,8 +167,9 @@ Measured on an RTX 4060 Laptop GPU:
 
 Rendering is the ceiling, and it is the one cost that scales with room size:
 about **10 fps with one remote peer, ~3 fps each with three**. Peers take strict
-turns on the GPU and each renders only its newest vector, so latency stays flat
-as the room grows — the frame rate degrades instead of a backlog forming.
+turns on the GPU and each renders only the newest vector its audio playhead has
+reached, so latency stays flat as the room grows — the frame rate degrades
+instead of a backlog forming.
 `--max-render-fps` caps the spend explicitly.
 
 Things worth knowing before relying on this:
@@ -169,7 +178,9 @@ Things worth knowing before relying on this:
   is batching warp+decode across peers into one forward pass, which would turn
   N×97 ms into something much closer to 97 ms.
 - **Audio latency** is roughly one chunk plus coding, ~300 ms one way at the
-  default. `--audio-chunk-ms 120` halves it at some bitrate overhead.
+  default. `--audio-chunk-ms 120` halves it at some bitrate overhead. Since
+  video is now paced to the audio playhead, this figure sets the latency of both
+  streams, not just the sound.
 - **Mesh topology.** Every peer connects to every other, so this is sensible up
   to about four participants. Beyond that it wants an SFU — though note the
   uplink cost of forwarding 150-byte frames is trivial.

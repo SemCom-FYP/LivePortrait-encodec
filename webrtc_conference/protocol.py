@@ -9,8 +9,9 @@ Three payload families, each self-describing via a one-byte magic:
   'B' blob    — a chunk of a larger reliable transfer (the avatar JPEG)
 
 All integers are little-endian. Motion fields are int16 fixed-point rather than
-float16: the expression deltas live around 1e-2, where float16's relative
-mantissa costs more precision than a fixed 6e-5 step.
+float16 because of the worst case, not the typical one: a float16 step grows
+with magnitude, reaching 2e-3 near the ends of the expression range, where a
+fixed 6.1e-5 step holds everywhere. The worst case is what shows on a face.
 """
 
 import struct
@@ -108,34 +109,36 @@ def _clip16(x):
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 
-_AUDIO_HEADER = struct.Struct("<BBHBH")     # magic, version, seq, n_q, n_frames
-AUDIO_HEADER_SIZE = _AUDIO_HEADER.size      # 7
+_AUDIO_HEADER = struct.Struct("<BBHIBH")    # magic, version, seq, t_ms, n_q, n_frames
+AUDIO_HEADER_SIZE = _AUDIO_HEADER.size      # 11
 CODEBOOK_BITS = 10                          # EnCodec codebooks hold 1024 entries
 
 
 @dataclass
 class AudioPacket:
     seq: int
+    t_ms: int                   # sender's capture clock, same units as MotionPacket.t_ms
     codes: np.ndarray           # (n_q, n_frames) int64
 
 
-def pack_audio(seq: int, codes: np.ndarray) -> bytes:
+def pack_audio(seq: int, t_ms: int, codes: np.ndarray) -> bytes:
     """Serialise EnCodec codes (n_q, n_frames) as a 10-bit-per-entry bitstream."""
     n_q, n_frames = codes.shape
     header = _AUDIO_HEADER.pack(
-        MAGIC_AUDIO, VERSION, seq & 0xFFFF, n_q, n_frames)
+        MAGIC_AUDIO, VERSION, seq & 0xFFFF, t_ms & 0xFFFFFFFF, n_q, n_frames)
     # Transmit frame-major so a truncated packet still decodes a prefix of time.
     return header + _bitpack10(np.ascontiguousarray(codes.T).ravel())
 
 
 def unpack_audio(data: bytes) -> AudioPacket:
-    magic, version, seq, n_q, n_frames = _AUDIO_HEADER.unpack_from(data, 0)
+    magic, version, seq, t_ms, n_q, n_frames = _AUDIO_HEADER.unpack_from(data, 0)
     if magic != MAGIC_AUDIO:
         raise ValueError(f"not an audio packet (magic={magic:#x})")
     if version != VERSION:
         raise ValueError(f"unsupported audio version {version}")
     flat = _bitunpack10(data[AUDIO_HEADER_SIZE:], n_q * n_frames)
-    return AudioPacket(seq=seq, codes=flat.reshape(n_frames, n_q).T.astype(np.int64))
+    return AudioPacket(seq=seq, t_ms=t_ms,
+                       codes=flat.reshape(n_frames, n_q).T.astype(np.int64))
 
 
 def audio_payload_size(n_q: int, n_frames: int) -> int:
@@ -205,3 +208,10 @@ class BlobReassembler:
 
 def peek_magic(data: bytes) -> int:
     return data[0] if data else 0
+
+
+def diff_t_ms(a: int, b: int) -> int:
+    """a - b for two t_ms clocks that wrap at 2**32, assuming the true gap is
+    under ~24 days (2**31 ms) so the wrap direction is unambiguous."""
+    d = (a - b) & 0xFFFFFFFF
+    return d - 0x100000000 if d >= 0x80000000 else d
