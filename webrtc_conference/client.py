@@ -45,6 +45,11 @@ from .signaling import DEFAULT_PORT, SignalingClient
 
 log = logging.getLogger("client")
 
+WINDOW_TITLE = "Neural Conference"
+DEFAULT_SIGNALING = f"ws://127.0.0.1:{DEFAULT_PORT}/ws"
+EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "assets", "examples", "source")
+
 # How far ahead of the audio playhead a motion packet may be and still be
 # rendered now instead of waiting another tick. Kept small because it lands
 # entirely on the leading side, and video that runs ahead of a voice is far
@@ -104,12 +109,21 @@ class ConferenceApp:
                                      crop_driving=not args.no_crop)
         self.camera = CameraReader(args.camera, args.width, args.height)
 
+        # Your own avatar, rendered from your own motion vectors exactly as the
+        # other side will render it — so you see what they see. Switchable in
+        # the call; the renderer is built on first use if it starts off.
         self.self_renderer: Optional[AvatarRenderer] = None
+        self.self_preview = False                   # rendering your own avatar right now
+        self._self_building = False
+        self._notices: "queue.Queue[str]" = queue.Queue()
         if args.preview_self:
             print("  building self-preview renderer …")
-            self.self_renderer = AvatarRenderer(self.engine, self.avatar_rgb,
-                                                args.driving_multiplier)
+            self._build_self_renderer()
         self.self_slot = LatestSlot()
+        self.self_motion = LatestSlot()             # newest own packet, for the self render
+        self.self_view = "avatar"                   # which one fills the tile: avatar | camera
+        self._self_frames = 0
+        self._self_render_ms = 0.0
 
         # Audio
         self.audio_codec: Optional[EncodecStreamCodec] = None
@@ -185,13 +199,10 @@ class ConferenceApp:
 
             self._broadcast_motion(payload)
             self.self_slot.put(("ok", self.encoder.last_crop_bgr))
-
-            if self.self_renderer is not None:
-                try:
-                    pkt = P.unpack_motion(payload)
-                    self.self_renderer.render(pkt)
-                except Exception as exc:
-                    log.debug("self preview failed: %s", exc)
+            if self.self_preview:
+                # Rendered on the render thread, not here: a warp on this
+                # thread would slow down the motion everyone else receives.
+                self.self_motion.put(payload)
 
     def _broadcast_motion(self, payload: bytes):
         if self.loop is None:
@@ -274,7 +285,7 @@ class ConferenceApp:
         min_period = 1.0 / self.args.max_render_fps if self.args.max_render_fps else 0.0
         last_render: dict[str, float] = {}
         while self.running:
-            work = False
+            work = self._render_self(last_render, min_period)
             for remote in list(self.remotes.values()):
                 if remote.renderer is None:
                     continue
@@ -302,6 +313,59 @@ class ConferenceApp:
                     remote.sync_drift_ms = P.diff_t_ms(pkt.t_ms, int(shown))
             if not work:
                 time.sleep(0.003)
+
+    def _render_self(self, last_render: dict, min_period: float) -> bool:
+        """One turn for your own avatar. Not paced to audio: there is none to
+        wait for locally, so it simply shows the newest vector you sent."""
+        if not self.self_preview or self.self_renderer is None:
+            return False
+        now = time.perf_counter()
+        if now - last_render.get("", 0.0) < min_period:
+            return False
+        payload = self.self_motion.take()
+        if payload is None:
+            return False
+        last_render[""] = now
+        try:
+            self.self_renderer.render(P.unpack_motion(payload))
+        except Exception as exc:
+            log.debug("self render failed: %s", exc)
+            return True
+        self._self_render_ms = (time.perf_counter() - now) * 1000
+        self._self_frames += 1
+        return True
+
+    def _build_self_renderer(self) -> bool:
+        """Pay the one-time F/W setup for your own portrait (~2 s on a GPU)."""
+        try:
+            self.self_renderer = AvatarRenderer(self.engine, self.avatar_rgb,
+                                                self.args.driving_multiplier)
+        except Exception as exc:
+            self._notices.put(f"Can't preview your avatar: {exc}")
+            log.warning("self preview unavailable: %s", exc)
+            return False
+        finally:
+            self._self_building = False
+        self.self_preview = True
+        return True
+
+    def set_self_preview(self, enabled: bool):
+        """Turn rendering of your own avatar on or off mid-call."""
+        if not enabled:
+            self.self_preview = False
+            self.self_motion.take()                 # drop anything still queued
+            self._notices.put("Self preview off — your camera is shown instead")
+        elif self.self_renderer is not None:
+            self.self_preview = True
+            self._notices.put("Self preview on")
+        elif not self._self_building:
+            self._self_building = True
+            self._notices.put("Preparing your avatar preview…")
+
+            def build():
+                if self._build_self_renderer():
+                    self._notices.put("Self preview on")
+            threading.Thread(target=build, daemon=True).start()
 
     def _build_renderer(self, remote: RemoteState, jpeg: bytes):
         """Off-loop: decode the peer's portrait and pay the one-time F/W setup."""
@@ -477,9 +541,10 @@ class ConferenceApp:
     # ── UI (main thread) ─────────────────────────────────────────────────────
 
     def ui_loop(self):
-        window = "Neural Conference — LivePortrait + EnCodec"
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        view = ui.CallView(WINDOW_TITLE, self.args.tile, self._controls())
         ref_kbps = ui.h264_reference_kbps(self.args.width, self.args.height, self.args.fps)
+        view.toast(f"Joined '{self.args.room}' — press R while facing the camera "
+                   "to calibrate", 4.0)
 
         while self.running:
             tiles = [self._self_tile()]
@@ -487,46 +552,88 @@ class ConferenceApp:
                 tiles.append(self._remote_tile(remote))
 
             tx_v, tx_a = self._tx_video.kbps(), self._tx_audio.kbps()
-            header =(f"room '{self.args.room}'   peers {len(self.remotes)}   "
-                      f"TX/stream: video {tx_v:5.1f} kbps + audio {tx_a:4.1f} kbps   "
-                      f"(H.264 at {self.args.width}x{self.args.height} would be "
+            header = (f"TX per stream: video {tx_v:.1f} kbps + audio {tx_a:.1f} kbps    "
+                      f"(H.264 at {self.args.width}x{self.args.height} would need "
                       f"~{ref_kbps:.0f} kbps)")
-            footer = "q quit    r re-calibrate neutral pose    s save a frame"
 
-            cv2.imshow(window, ui.compose(tiles, self.args.tile, header, footer))
-            key = cv2.waitKey(15) & 0xFF
-            if key in (ord("q"), 27):
+            view.controls = self._controls()
+            while not self._notices.empty():
+                view.toast(self._notices.get_nowait())
+            action = view.show(tiles, self.args.room, header)
+            if action == "leave":
                 self.running = False
-            elif key == ord("r"):
+            elif action == "recalibrate":
                 self._calibrate_next = True
                 self.encoder.reset_tracking()
                 for r in self.remotes.values():
                     if r.renderer is not None:
                         r.renderer.reset_reference()
+                if self.self_renderer is not None:
+                    # Its calibrate packet may be overwritten in the one-deep
+                    # slot before it renders, so reset directly as well.
+                    self.self_renderer.reset_reference()
+                view.toast("Re-calibrating neutral pose")
                 print("Re-calibrating neutral pose.")
-            elif key == ord("s"):
+            elif action == "preview":
+                self.set_self_preview(not self.self_preview)
+            elif action == "selfview":
+                self.self_view = "camera" if self.self_view == "avatar" else "avatar"
+                view.toast("Showing your camera" if self.self_view == "camera"
+                           else "Showing your generated avatar")
+            elif action == "snapshot" and view.frame is not None:
                 path = f"conference_{int(time.time())}.png"
-                cv2.imwrite(path, ui.compose(tiles, self.args.tile, header, footer))
+                cv2.imwrite(path, view.frame)
+                view.toast(f"Saved {path}")
                 print(f"Saved {path}")
 
+        view.close()
         cv2.destroyAllWindows()
+
+    def _controls(self) -> list:
+        on = self.self_preview
+        label = "Preparing…" if self._self_building else f"Self preview: {'on' if on else 'off'}"
+        toggle = ui.Control("P", label, "preview", "toggle_on" if on else "default")
+        return [toggle] + ([ui.SELF_VIEW_CONTROL] if on else []) + ui.CALL_CONTROLS
 
     def _self_tile(self) -> ui.Tile:
         slot = self.self_slot.peek()
-        status, image = slot if slot else ("waiting", None)
-        if self.self_renderer is not None and status == "ok":
-            image = self.self_renderer.last_frame_bgr
+        status, camera = slot if slot else ("waiting", None)
+        renderer = self.self_renderer if self.self_preview else None
+        generated = None
+        if renderer is not None:
+            generated = renderer.last_frame_bgr if self._self_frames else renderer.source_bgr_256
+
         # Derived from the same meter as the bitrate, so the two always agree —
         # frames dropped for a missing face show up in both.
-        subtitle = (f"{self._tx_video.pps():4.1f} fps sent   "
+        subtitle = (f"{self._tx_video.pps():.1f} fps sent   "
                     f"extract {self._extract_ms:.0f} ms   "
                     f"{P.MOTION_PACKET_SIZE} B/frame")
+        if renderer is not None:
+            subtitle += f"   self render {self._self_render_ms:.0f} ms"
+
+        if self.self_view == "avatar" and generated is not None:
+            image, inset = generated, camera
+            badge, inset_label = "Generated · what others see", "camera"
+        else:
+            image, inset = camera, generated
+            badge, inset_label = ("Camera" if renderer is not None
+                                  else "Camera · self preview off"), "generated"
+        if image is None:
+            image, inset = inset, None
+        badge_color = ui.ACCENT
+        if status == "noface":
+            badge, badge_color = "No face detected · not sending", ui.RED
+
         return ui.Tile(
             title=f"{self.args.name} (you)",
             image=image,
             subtitle=subtitle,
-            status="no face detected" if status == "noface" else "starting camera…",
+            status="starting camera…",
             accent=ui.GREEN if status == "ok" else ui.RED,
+            inset=inset,
+            inset_label=inset_label,
+            badge=badge if image is not None else "",
+            badge_color=badge_color,
         )
 
     def _remote_tile(self, remote: RemoteState) -> ui.Tile:
@@ -539,7 +646,7 @@ class ConferenceApp:
             v_kbps, a_kbps = peer.stats_rx.kbps()
             have_sync = remote.av_sync.playhead_t_ms() is not None
             sync = f"{remote.sync_drift_ms:+.0f} ms" if have_sync else "n/a"
-            subtitle = (f"video {v_kbps:5.1f} kbps   audio {a_kbps:4.1f} kbps   "
+            subtitle = (f"video {v_kbps:.1f} kbps   audio {a_kbps:.1f} kbps   "
                         f"render {remote.render_ms:.0f} ms   lost {remote.lost}   "
                         f"a/v sync {sync}")
         else:
@@ -604,14 +711,23 @@ def _swallow(fn, *a):
         log.debug("send failed: %s", exc)
 
 
+def _default_name() -> str:
+    return os.environ.get("USERNAME") or os.environ.get("USER") or "guest"
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Neural web conference: LivePortrait motion vectors + EnCodec over aiortc",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--avatar", "-a", help="Portrait image that represents you")
-    p.add_argument("--name", "-n", default=os.environ.get("USERNAME", "guest"))
-    p.add_argument("--room", "-r", default="demo")
-    p.add_argument("--signaling", default=f"ws://127.0.0.1:{DEFAULT_PORT}/ws")
+    p.add_argument("--avatar", "-a",
+                   help="Portrait image that represents you (omit to open the lobby)")
+    p.add_argument("--name", "-n", default=None,
+                   help="Display name (default: last one used, else $USERNAME)")
+    p.add_argument("--room", "-r", default=None, help="Room to join (default: demo)")
+    p.add_argument("--signaling", default=None,
+                   help=f"Signaling websocket URL (default: {DEFAULT_SIGNALING})")
+    p.add_argument("--lobby", action="store_true",
+                   help="Always show the lobby, even when --avatar is given")
     p.add_argument("--stun", nargs="*", default=[DEFAULT_STUN],
                    help="STUN URLs (pass with no values to disable)")
     p.add_argument("--turn", nargs="*", default=[],
@@ -634,8 +750,10 @@ def parse_args(argv=None):
     g.add_argument("--driving-multiplier", type=float, default=1.0)
     g.add_argument("--max-render-fps", type=float, default=0,
                    help="Cap the render rate per remote peer (0 = as fast as the GPU allows)")
-    g.add_argument("--preview-self", action="store_true",
-                   help="Also render your own avatar locally (costs a second GPU pass)")
+    g.add_argument("--preview-self", action=argparse.BooleanOptionalAction, default=None,
+                   help="Render your own avatar locally so you see what others see "
+                        "(costs one extra warp+decode per frame; toggle with P in the "
+                        "call; default: on, or your last lobby choice)")
     g.add_argument("--avatar-quality", type=int, default=90)
     g.add_argument("--tile", type=int, default=384, help="Tile size in the grid")
     g.add_argument("--cpu", action="store_true", help="Force LivePortrait onto the CPU")
@@ -669,14 +787,40 @@ def main(argv=None):
     if args.list_devices:
         print(list_devices())
         return 0
-    if not args.avatar:
-        print("error: --avatar is required (a portrait image that represents you)",
-              file=sys.stderr)
-        return 2
+    if args.lobby or not args.avatar:
+        prefs = ui.load_prefs()
+        result = ui.Lobby(
+            name=args.name or prefs.get("name") or _default_name(),
+            room=args.room or "",
+            avatar=args.avatar or prefs.get("avatar"),
+            signaling=args.signaling or prefs.get("signaling") or DEFAULT_SIGNALING,
+            camera=args.camera,
+            examples_dir=EXAMPLES_DIR,
+            preview_self=(args.preview_self if args.preview_self is not None
+                          else prefs.get("preview_self", True))).run()
+        if result is None:
+            print("Lobby closed; not joining.")
+            return 0
+        args.name, args.room = result.name, result.room
+        args.avatar, args.signaling = result.avatar, result.signaling
+        args.preview_self = result.preview_self
+        ui.save_prefs(name=result.name, avatar=result.avatar,
+                      signaling=result.signaling, room=result.room,
+                      preview_self=result.preview_self)
+        print(f"{'Creating' if result.created else 'Joining'} room '{args.room}' "
+              f"as {args.name}")
+
+    args.name = args.name or _default_name()
+    args.room = args.room or "demo"
+    args.signaling = args.signaling or DEFAULT_SIGNALING
+    if args.preview_self is None:
+        args.preview_self = True
     if not os.path.exists(args.avatar):
         print(f"error: avatar not found: {args.avatar}", file=sys.stderr)
         return 2
 
+    ui.show_splash(WINDOW_TITLE, "Loading LivePortrait…",
+                   f"Joining '{args.room}' as {args.name}")
     ConferenceApp(args).run()
     return 0
 

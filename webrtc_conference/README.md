@@ -38,7 +38,29 @@ Start the signaling server once, anywhere both participants can reach:
 python -m webrtc_conference.signaling --port 8765
 ```
 
-Then each participant runs a client:
+Then each participant runs a client. With no arguments it opens a **lobby**:
+
+```bash
+python -m webrtc_conference.client
+```
+
+There you:
+
+- **pick a reference image**: choose a file, click one of the bundled examples,
+  or press *Capture from camera* (3-second countdown; the shot is saved under
+  `~/.liveportrait_conference/captures/`)
+- **enter your name**
+- **create a room**, which suggests a shareable code like `sunny-otter-42`
+  (*New code* rerolls it), or **join a room** by typing its code or clicking
+  one of the live rooms the signaling server reports
+- optionally change the signaling server URL
+
+The lobby remembers your name, image and server for next time
+(`~/.liveportrait_conference/lobby.json`). Keys: `Tab` moves to the next field,
+`Enter` joins, `Esc` quits, and `Ctrl+V` pastes into a field.
+
+To skip the lobby, pass everything on the command line (`--lobby` shows it
+anyway, pre-filled with those values):
 
 ```bash
 python -m webrtc_conference.client \
@@ -62,15 +84,27 @@ different ones — `cv2.VideoCapture` fails on the second, so pass `--camera 1`
 to the second client, or `--no-audio` and a second camera index when you just
 want to watch the mesh come up.
 
+Your own tile shows your **generated avatar** (rendered from your own motion
+vectors, exactly as the others see you) with your live camera as an inset;
+*Self view* (`v`) swaps the two. Rendering your own avatar costs one extra
+warp+decode per frame, so it can be switched off: untick *Show my generated
+avatar* in the lobby, press *Self preview* (`p`) during the call, or pass
+`--no-preview-self`. The lobby remembers the choice. The call window has
+clickable buttons for each of these, plus *Recalibrate*, *Snapshot* and
+*Leave*, with keyboard shortcuts:
+
 | key | action |
 |-----|--------|
-| `q` / `Esc` | leave the call |
+| `p` | turn the preview of your own generated avatar on/off |
+| `v` | swap your tile between generated avatar and camera (while the preview is on) |
+| `q` / `Esc` | leave the call (closing the window also works) |
 | `r` | re-calibrate your neutral pose (do this while facing the camera straight on) |
 | `s` | save a PNG of the current grid |
 
 Useful flags: `--fps` (motion vectors per second), `--bandwidth`
 (EnCodec kbps: 1.5/3/6/12/24), `--audio-chunk-ms` (latency vs. overhead),
-`--max-render-fps` (cap GPU spend per peer), `--preview-self`,
+`--max-render-fps` (cap GPU spend per peer), `--no-preview-self`
+(skip rendering your own avatar to save GPU),
 `--no-audio`, `--list-devices`, `--cpu`.
 
 ## Verify without a second machine
