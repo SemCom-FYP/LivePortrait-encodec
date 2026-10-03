@@ -277,7 +277,7 @@ encoder cannot stall ICE or the datachannels.
 
 | Thread | Owns | Does |
 | --- | --- | --- |
-| main | the OpenCV window | composes tiles, reads keys |
+| main | the Qt (PySide6) window | paints tiles, handles buttons and keys |
 | asyncio loop | aiortc and SCTP | signaling, every send and receive |
 | capture | camera, extractor M | crop, extract, quantise, hand off |
 | render | the GPU | warp + decode, one peer per turn |

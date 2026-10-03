@@ -30,6 +30,10 @@ downloaded into `pretrained_weights/`). Then:
 pip install -r webrtc_conference/requirements.txt
 ```
 
+The interface is built with **PySide6** (Qt), which that file installs. OpenCV
+is only used for camera capture and image I/O, so `opencv-python-headless` works
+too.
+
 ## Run
 
 Start the signaling server once, anywhere both participants can reach:
@@ -181,7 +185,8 @@ that carries the capture timestamp) close to the model's nominal 6.0.
 
 ### Threading
 
-aiortc owns an asyncio loop on a background thread; OpenCV owns the main thread.
+aiortc owns an asyncio loop on a background thread; Qt (PySide6) owns the main
+thread.
 Torch never runs on the loop. Capture, motion extraction, rendering and audio
 coding each have their own thread and hand finished buffers across with
 `call_soon_threadsafe` or a one-deep mailbox. Incoming motion is the exception:

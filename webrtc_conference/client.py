@@ -5,8 +5,8 @@ Conference participant.
     python -m webrtc_conference.client --room demo --name Alice \
         --avatar assets/examples/source/s6.jpg
 
-Threading: aiortc owns an asyncio loop on a background thread; OpenCV owns the
-main thread. Torch work never touches the loop — capture, motion extraction,
+Threading: aiortc owns an asyncio loop on a background thread; Qt (PySide6)
+owns the main thread. Torch work never touches the loop — capture, motion extraction,
 rendering and audio coding each run on their own thread and hand finished
 buffers across with `call_soon_threadsafe` or a one-deep mailbox.
 
@@ -28,7 +28,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import cv2
 import numpy as np
 from aiortc import RTCIceServer
 
@@ -541,27 +540,29 @@ class ConferenceApp:
     # ── UI (main thread) ─────────────────────────────────────────────────────
 
     def ui_loop(self):
-        view = ui.CallView(WINDOW_TITLE, self.args.tile, self._controls())
+        """Run the call window on the main thread until the user leaves."""
         ref_kbps = ui.h264_reference_kbps(self.args.width, self.args.height, self.args.fps)
-        view.toast(f"Joined '{self.args.room}' — press R while facing the camera "
-                   "to calibrate", 4.0)
+        win: Optional[ui.CallWindow] = None
 
-        while self.running:
+        def refresh() -> Optional[ui.CallState]:
+            if not self.running:
+                win.close()
+                return None
             tiles = [self._self_tile()]
             for remote in list(self.remotes.values()):
                 tiles.append(self._remote_tile(remote))
-
             tx_v, tx_a = self._tx_video.kbps(), self._tx_audio.kbps()
             header = (f"TX per stream: video {tx_v:.1f} kbps + audio {tx_a:.1f} kbps    "
                       f"(H.264 at {self.args.width}x{self.args.height} would need "
                       f"~{ref_kbps:.0f} kbps)")
-
-            view.controls = self._controls()
             while not self._notices.empty():
-                view.toast(self._notices.get_nowait())
-            action = view.show(tiles, self.args.room, header)
+                win.toast(self._notices.get_nowait())
+            return ui.CallState(tiles, header, self._controls())
+
+        def on_action(action: str):
             if action == "leave":
                 self.running = False
+                win.close()
             elif action == "recalibrate":
                 self._calibrate_next = True
                 self.encoder.reset_tracking()
@@ -572,22 +573,26 @@ class ConferenceApp:
                     # Its calibrate packet may be overwritten in the one-deep
                     # slot before it renders, so reset directly as well.
                     self.self_renderer.reset_reference()
-                view.toast("Re-calibrating neutral pose")
+                win.toast("Re-calibrating neutral pose")
                 print("Re-calibrating neutral pose.")
             elif action == "preview":
                 self.set_self_preview(not self.self_preview)
             elif action == "selfview":
                 self.self_view = "camera" if self.self_view == "avatar" else "avatar"
-                view.toast("Showing your camera" if self.self_view == "camera"
-                           else "Showing your generated avatar")
-            elif action == "snapshot" and view.frame is not None:
+                win.toast("Showing your camera" if self.self_view == "camera"
+                          else "Showing your generated avatar")
+            elif action == "snapshot":
                 path = f"conference_{int(time.time())}.png"
-                cv2.imwrite(path, view.frame)
-                view.toast(f"Saved {path}")
-                print(f"Saved {path}")
+                if win.snapshot(path):
+                    win.toast(f"Saved {path}")
+                    print(f"Saved {path}")
+                else:
+                    win.toast("Could not save the snapshot")
 
-        view.close()
-        cv2.destroyAllWindows()
+        win = ui.CallWindow(WINDOW_TITLE, self.args.room, self.args.tile, refresh, on_action)
+        win.toast(f"Joined '{self.args.room}' — press R while facing the camera "
+                  "to calibrate", 4.0)
+        ui.exec_window(win)
 
     def _controls(self) -> list:
         on = self.self_preview
@@ -664,8 +669,6 @@ class ConferenceApp:
         self.start_workers()
         try:
             self.ui_loop()
-        except KeyboardInterrupt:
-            pass
         finally:
             self.running = False
             thread.join(timeout=5.0)
@@ -787,9 +790,10 @@ def main(argv=None):
     if args.list_devices:
         print(list_devices())
         return 0
+    ui.ensure_app()
     if args.lobby or not args.avatar:
         prefs = ui.load_prefs()
-        result = ui.Lobby(
+        result = ui.run_lobby(
             name=args.name or prefs.get("name") or _default_name(),
             room=args.room or "",
             avatar=args.avatar or prefs.get("avatar"),
@@ -797,7 +801,7 @@ def main(argv=None):
             camera=args.camera,
             examples_dir=EXAMPLES_DIR,
             preview_self=(args.preview_self if args.preview_self is not None
-                          else prefs.get("preview_self", True))).run()
+                          else prefs.get("preview_self", True)))
         if result is None:
             print("Lobby closed; not joining.")
             return 0
@@ -819,9 +823,20 @@ def main(argv=None):
         print(f"error: avatar not found: {args.avatar}", file=sys.stderr)
         return 2
 
-    ui.show_splash(WINDOW_TITLE, "Loading LivePortrait…",
-                   f"Joining '{args.room}' as {args.name}")
-    ConferenceApp(args).run()
+    # Model loading takes seconds; it runs on a worker thread behind a loading
+    # window so the GUI stays responsive (and closable) meanwhile.
+    try:
+        app = ui.run_with_loading(WINDOW_TITLE, "Loading LivePortrait…",
+                                  f"Joining '{args.room}' as {args.name}",
+                                  lambda: ConferenceApp(args))
+    except KeyboardInterrupt:
+        print("Cancelled while loading.")
+        return 130
+    except Exception as exc:
+        log.exception("could not start the call")
+        ui.show_error("Could not start the call", str(exc))
+        return 1
+    app.run()
     return 0
 
 
