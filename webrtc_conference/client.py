@@ -64,6 +64,12 @@ EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 # roughly +45 ms against -125 ms).
 AV_SYNC_SLACK_MS = 10
 
+# Cycle for the "Render" control (D): 1 decodes every due packet, N>1 decodes
+# only every Nth and reuses the previous frame otherwise — see webcam_inference.py's
+# --decode_every, which this mirrors. Trades a peer's own update rate for GPU time
+# the round-robin can spend on the rest of the room (and on self-preview).
+DECODE_EVERY_LEVELS = [1, 2, 3, 4]
+
 
 @dataclass
 class RemoteState:
@@ -83,6 +89,7 @@ class RemoteState:
     render_ms: float = 0.0
     last_seq: int = -1
     lost: int = 0
+    due_count: int = 0           # due packets seen, for the decode-every cadence
 
 
 class ConferenceApp:
@@ -101,6 +108,9 @@ class ConferenceApp:
         self._tx_audio = RateMeter()
         self._extract_ms = 0.0
         self._lock = threading.Lock()
+        self.decode_every = (args.decode_every
+                             if args.decode_every in DECODE_EVERY_LEVELS else 1)
+        self._self_due_count = 0
 
         self.ice_servers = _ice_servers(args)
         print(f"  ICE: {_describe_ice(self.ice_servers)}")
@@ -372,6 +382,14 @@ class ConferenceApp:
                     self._notices.put(f"Translating to {LANGUAGES[code].name}")
             threading.Thread(target=build, daemon=True).start()
 
+    def cycle_decode_every(self):
+        """D in the call: 1 -> 2 -> 3 -> 4 -> back to 1 (full rate)."""
+        idx = DECODE_EVERY_LEVELS.index(self.decode_every)
+        self.decode_every = DECODE_EVERY_LEVELS[(idx + 1) % len(DECODE_EVERY_LEVELS)]
+        label = ("full rate" if self.decode_every == 1
+                 else f"1/{self.decode_every} rate")
+        self._notices.put(f"Render: {label} (more GPU time for the rest of the room)")
+
     def _render_loop(self):
         """Round-robins the GPU across every peer that has a fresh motion vector.
 
@@ -406,6 +424,9 @@ class ConferenceApp:
                     continue
                 work = True
                 last_render[remote.peer_id] = now
+                remote.due_count += 1
+                if remote.due_count % self.decode_every != 0:
+                    continue        # tile keeps showing renderer.last_frame_bgr
                 try:
                     remote.renderer.render(pkt)
                 except Exception as exc:
@@ -433,6 +454,9 @@ class ConferenceApp:
         if payload is None:
             return False
         last_render[""] = now
+        self._self_due_count += 1
+        if self._self_due_count % self.decode_every != 0:
+            return True          # tile keeps showing self_renderer.last_frame_bgr
         try:
             self.self_renderer.render(P.unpack_motion(payload))
         except Exception as exc:
@@ -690,6 +714,8 @@ class ConferenceApp:
                 self.set_self_preview(not self.self_preview)
             elif action == "translate":
                 self.cycle_translation()
+            elif action == "decode_every":
+                self.cycle_decode_every()
             elif action == "selfview":
                 self.self_view = "camera" if self.self_view == "avatar" else "avatar"
                 win.toast("Showing your camera" if self.self_view == "camera"
@@ -721,6 +747,10 @@ class ConferenceApp:
                 label = "Translate: off"
             controls.append(ui.Control("T", label, "translate",
                                        "toggle_on" if self.translate_to else "default"))
+        render_label = ("Render: full rate" if self.decode_every == 1
+                       else f"Render: 1/{self.decode_every} rate")
+        controls.append(ui.Control("D", render_label, "decode_every",
+                                   "toggle_on" if self.decode_every > 1 else "default"))
         return controls + ui.CALL_CONTROLS
 
     def _self_tile(self) -> ui.Tile:
@@ -883,6 +913,11 @@ def parse_args(argv=None):
     g.add_argument("--driving-multiplier", type=float, default=1.0)
     g.add_argument("--max-render-fps", type=float, default=0,
                    help="Cap the render rate per remote peer (0 = as fast as the GPU allows)")
+    g.add_argument("--decode-every", type=int, default=1, choices=DECODE_EVERY_LEVELS,
+                   help="Generate a new face only every N due motion packets per tile "
+                        "(self-preview included); skipped turns keep showing the last "
+                        "rendered frame. Frees GPU time for the rest of the room at the "
+                        "cost of that tile's own update rate. Cycle with D in the call.")
     g.add_argument("--preview-self", action=argparse.BooleanOptionalAction, default=None,
                    help="Render your own avatar locally so you see what others see "
                         "(costs one extra warp+decode per frame; toggle with P in the "

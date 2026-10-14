@@ -84,6 +84,9 @@ class LivePortraitEngine:
     """
 
     def __init__(self, force_cpu: bool = False, half: bool = True):
+        # Every tensor shape here is fixed, so cuDNN's per-shape autotuning is
+        # paid once; it halves the 3-D warp (~51 -> ~25 ms on an RTX 4060 Laptop).
+        torch.backends.cudnn.benchmark = True
         cfg = InferenceConfig()
         cfg.flag_force_cpu = force_cpu
         cfg.flag_use_half_precision = half and not force_cpu
