@@ -14,6 +14,7 @@ pretrained_weights/docs
 pretrained_weights/liveportrait
 pretrained_weights/liveportrait_animals
 pretrained_weights/insightface 
+pretrained_weights/translation
 
 # Ipython notebook
 *.ipynb

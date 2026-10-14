@@ -123,12 +123,15 @@ class SpeakerMixer:
         np.clip(mix, -1.0, 1.0, out=mix)
         outdata[:, 0] = mix
 
-    def push(self, peer_id: str, pcm: np.ndarray):
+    def push(self, peer_id: str, pcm: np.ndarray, cap_s: Optional[float] = None):
+        """Queue audio for one source. `cap_s` overrides the buffer limit for
+        sources that arrive in bursts longer than it, like synthesised speech."""
+        cap = self._cap if cap_s is None else int(self.sample_rate * cap_s)
         with self._lock:
             buf = self._buffers.get(peer_id)
             buf = pcm.astype(np.float32) if buf is None else np.concatenate([buf, pcm])
-            if buf.size > self._cap:               # late audio is useless audio
-                buf = buf[-self._cap:]
+            if buf.size > cap:                     # late audio is useless audio
+                buf = buf[-cap:]
             self._buffers[peer_id] = buf
 
     def drop(self, peer_id: str):

@@ -104,12 +104,77 @@ clickable buttons for each of these, plus *Recalibrate*, *Snapshot* and
 | `q` / `Esc` | leave the call (closing the window also works) |
 | `r` | re-calibrate your neutral pose (do this while facing the camera straight on) |
 | `s` | save a PNG of the current grid |
+| `t` | translation: off → Spanish → French → off (see below) |
 
 Useful flags: `--fps` (motion vectors per second), `--bandwidth`
 (EnCodec kbps: 1.5/3/6/12/24), `--audio-chunk-ms` (latency vs. overhead),
 `--max-render-fps` (cap GPU spend per peer), `--no-preview-self`
 (skip rendering your own avatar to save GPU),
 `--no-audio`, `--list-devices`, `--cpu`.
+
+### Hearing others translated
+
+Press `t` (or start with `--translate es`) to hear everyone else's English in
+Spanish or French instead of their own voices. It is a per-listener choice:
+nothing changes for the speaker or for anyone else in the room, and nothing
+extra goes over the wire.
+
+```
+decoded EnCodec audio → Silero VAD → Whisper (GPU, re-read every second)
+    → whole English sentences → Opus-MT (GPU) → Piper or Pocket TTS → speaker
+```
+
+Install the extra packages listed at the bottom of `requirements.txt`. The
+first time a language is chosen, its translation model (converted once to
+int8 CTranslate2, ~75 MB) and Piper voice (~60 MB) are fetched into
+`pretrained_weights/translation/`; after that switching is instant.
+
+By default the translated voice is synthesised by Piper, one fixed voice per
+language. Pass `--tts pocket` to use Kyutai's Pocket TTS instead
+(`pip install pocket-tts`, not in `requirements.txt`): a 100M-parameter model
+that clones a reference voice rather than shipping a fixed one — every
+peer's translated speech comes out in the same cloned voice, in whichever
+language they're being translated to. It needs no GPU (~2-6x real-time on a
+CPU), at a smaller model's quality ceiling than Piper. By default it clones
+a bundled named voice ("alba"); pass `--voice-reference path/to/clip.wav` to
+clone a specific voice instead, or a Pocket TTS named voice / `hf://` path
+(see https://huggingface.co/kyutai/tts-voices).
+
+**Accuracy first: only whole sentences are translated.** Cutting speech into
+fixed pieces splits sentences, and then both the recogniser and the
+translator guess at the half they didn't see. Instead, Whisper re-reads the
+sentence in progress from its first word every second, and a word is only
+accepted once two readings in a row agree on it. Sentences end at Whisper's
+own punctuation, or when the speaker stops for 0.8 s; a shorter pause for
+breath stays inside the sentence. A sentence that runs past 6 s gives up the
+clauses it has finished, but only at a comma or before *so / because / but /
+which / while / although*, where each side keeps its meaning. Only past 12 s
+may it split before *and / or*.
+
+On a 38 s test script, the English came out word-perfect (94/94 words),
+every sentence boundary was right, and a sentence with a 600 ms pause inside
+it stayed one sentence.
+
+The translated voice runs about a sentence behind the speaker: ~1.3–1.8 s
+after a sentence is finished. After a long sentence it can be a few seconds
+more, because its translation takes as long to say. Spanish and French run
+~15–20 % longer than the English, so the speaking rate is chosen per sentence
+(up to 1.35×) to fit the time the original took and to work off any backlog.
+Faces are not delayed to match. They stay live, timed against the original
+audio. Each remote tile shows the current lag (`→ es lag 1.4 s`).
+
+Flags: `--translate {es,fr,de,it}`, `--translate-langs es fr` (what `t`
+cycles through), `--mt-model base|big` (transformer-big Opus-MT for es/fr/it,
+~465 MB download each), `--asr-model` (faster-whisper size, default `small`;
+`large-v3-turbo` hears accents and noisy rooms better, ~1.6 GB),
+`--asr-device auto|cuda|cpu`. A GPU matters here: Whisper re-reads every
+second, which takes ~0.2 s on a GPU and 1.3–2 s on a CPU, where readings
+become less frequent and sentences come out later.
+
+Voice: `--tts piper|pocket` (default `piper`), `--voice-reference` (Pocket
+TTS only — a wav file, named voice, or `hf://` path to clone),
+`--pocket-device auto|cuda|cpu`, `--pocket-quantize` (Pocket TTS only, CPU
+int8 quantization).
 
 ## Verify without a second machine
 

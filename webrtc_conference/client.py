@@ -14,6 +14,12 @@ A/V sync: audio is the master clock, because the speaker drains at a rate we
 do not control. Motion and audio both carry the sender's capture timestamp,
 and motion waits in a per-peer queue until the instant it was captured comes
 up on that peer's audio playhead — see AVSync and MotionJitterBuffer.
+
+Translation (T in the call, or --translate es): each peer's decoded voice
+goes to a PeerTranslation instead of the speaker, and its translated speech
+plays in place of the original — see translator.py. The motion clock keeps
+running as if the original were playing, so faces stay live and the
+translated voice follows a phrase behind.
 """
 
 import argparse
@@ -41,6 +47,8 @@ from .motion_codec import (AvatarRenderer, LivePortraitEngine, MotionEncoder,
                            decode_avatar_jpeg, encode_avatar_jpeg, load_avatar_rgb)
 from .peer import DEFAULT_STUN, NeuralPeer, RateMeter, build_ice_servers
 from .signaling import DEFAULT_PORT, SignalingClient
+from .translator import (DEFAULT_POCKET_VOICE, LANGUAGES, VOICE_BUFFER_S, VOICE_SUFFIX,
+                         PeerTranslation, PocketTTSVoice, SpeechTranslator)
 
 log = logging.getLogger("client")
 
@@ -69,6 +77,7 @@ class RemoteState:
     audio_q: "queue.Queue[P.AudioPacket]" = field(default_factory=lambda: queue.Queue(maxsize=8))
     joiner: CrossfadeJoiner = field(default_factory=CrossfadeJoiner)
     av_sync: AVSync = field(default_factory=AVSync)
+    translation: Optional[PeerTranslation] = None
     sync_drift_ms: float = 0.0
     frames_rendered: int = 0
     render_ms: float = 0.0
@@ -106,7 +115,12 @@ class ConferenceApp:
 
         self.encoder = MotionEncoder(self.engine, det_interval=args.det_interval,
                                      crop_driving=not args.no_crop)
-        self.camera = CameraReader(args.camera, args.width, args.height)
+        # --camera -1 skips the webcam entirely: useful for a listen-only
+        # client testing translation on a machine with only one camera, since
+        # a peer still gets this client's audio and avatar either way — only
+        # its own motion (and so its rendered tile) never appears.
+        self.camera = (CameraReader(args.camera, args.width, args.height)
+                       if args.camera >= 0 else None)
 
         # Your own avatar, rendered from your own motion vectors exactly as the
         # other side will render it — so you see what they see. Switchable in
@@ -139,6 +153,20 @@ class ConferenceApp:
                 chunk_ms=args.audio_chunk_ms)
             self.speaker = SpeakerMixer(SAMPLE_RATE, device=args.output_device)
 
+        # Translation: built on first use, since Whisper and each language's
+        # models take seconds to load (and a download the first time).
+        self.translator: Optional[SpeechTranslator] = None
+        self.translate_to: Optional[str] = None     # language being heard now
+        self._translate_loading: Optional[str] = None
+        # Only used when --tts pocket: one cloned voice, shared across every
+        # peer's translated speech and every target language (see
+        # translator.PocketTTSVoice — one checkpoint per language, all
+        # cloned to the same reference clip).
+        self.pocket_voice: Optional[PocketTTSVoice] = None
+        if args.translate and self.audio_codec is not None:
+            print(f"  loading translation to {LANGUAGES[args.translate].name} …")
+            self._load_translation(args.translate)
+
     # ── threads ──────────────────────────────────────────────────────────────
 
     def start_workers(self):
@@ -160,6 +188,8 @@ class ConferenceApp:
 
     def _capture_loop(self):
         """Webcam -> motion vector -> every peer."""
+        if self.camera is None:
+            return
         period = 1.0 / max(self.args.fps, 1)
         next_tick = time.perf_counter()
         while self.running:
@@ -254,6 +284,9 @@ class ConferenceApp:
                 except Exception as exc:
                     log.debug("audio decode failed: %s", exc)
                     continue
+                if self.translate_to is not None:
+                    self._feed_translation(remote, pkt.t_ms, remote.joiner.push(pcm))
+                    continue
                 # Measured before the push, so it counts only what has to play
                 # out first; the device's own buffering sits behind that again
                 # and is large enough on Windows to matter for lip sync.
@@ -263,6 +296,81 @@ class ConferenceApp:
                 self.speaker.push(remote.peer_id, remote.joiner.push(pcm))
             if not work:
                 time.sleep(0.005)
+
+    def _feed_translation(self, remote: RemoteState, t_ms: int, pcm: np.ndarray):
+        if remote.translation is None:
+            key = remote.peer_id + VOICE_SUFFIX
+            remote.translation = PeerTranslation(
+                self.translator, remote.name, self.translate_to,
+                out=lambda p, k=key: self.speaker.push(k, p, cap_s=VOICE_BUFFER_S),
+                backlog_ms=lambda k=key: self.speaker.backlog_ms(k),
+                speak_fn=self.pocket_voice.speak if self.pocket_voice is not None else None)
+        remote.translation.feed(pcm)
+        # Nothing of the original is queued for this peer, so run the motion
+        # clock as if it were playing with no backlog: the face stays live and
+        # the translated voice follows a phrase behind it.
+        remote.av_sync.note_audio_push(t_ms, self.speaker.output_latency_ms)
+
+    def _load_translation(self, code: str) -> bool:
+        """Whisper once, then this language's MT model and voice."""
+        try:
+            if self.translator is None:
+                self.translator = SpeechTranslator(
+                    self.args.asr_model, device=self.args.asr_device,
+                    threads=self.args.translate_threads, mt_size=self.args.mt_model,
+                    load_tts=(self.args.tts == "piper"))
+                log.info("speech recognition: whisper %s on %s",
+                         self.args.asr_model, self.translator.asr_device)
+            if self.args.tts == "pocket" and self.pocket_voice is None:
+                print(f"  loading Pocket TTS ({self.args.pocket_device}) …")
+                self.pocket_voice = PocketTTSVoice(
+                    device=self.args.pocket_device, quantize=self.args.pocket_quantize)
+                self.pocket_voice.clone(self.args.voice_reference or DEFAULT_POCKET_VOICE)
+            self.translator.prepare(code)
+        except Exception as exc:
+            self._notices.put(f"Can't translate to {LANGUAGES[code].name}: {exc}")
+            log.warning("translation unavailable: %s", exc)
+            return False
+        finally:
+            self._translate_loading = None
+        self._set_translation(code)
+        return True
+
+    def _set_translation(self, code: Optional[str]):
+        """Switch every peer to `code`, or back to their own voices with None."""
+        self.translate_to = code
+        for remote in list(self.remotes.values()):
+            if remote.translation is not None:
+                remote.translation.set_target(code)
+            # Whichever voice is going out is cut now rather than finishing
+            # the backlog it already had queued.
+            self.speaker.drop(remote.peer_id + VOICE_SUFFIX if code is None
+                              else remote.peer_id)
+
+    def cycle_translation(self):
+        """T in the call: off, then each --translate-langs language, then off."""
+        if self.speaker is None:
+            self._notices.put("Translation needs audio (started with --no-audio)")
+            return
+        if self._translate_loading:
+            return
+        order = [None] + list(self.args.translate_langs)
+        current = self.translate_to if self.translate_to in order else None
+        code = order[(order.index(current) + 1) % len(order)]
+        if code is None:
+            self._set_translation(None)
+            self._notices.put("Translation off — original voices")
+        elif self.translator is not None and self.translator.is_ready(code):
+            self._set_translation(code)
+            self._notices.put(f"Translating to {LANGUAGES[code].name}")
+        else:
+            self._translate_loading = code
+            self._notices.put(f"Preparing {LANGUAGES[code].name} translation…")
+
+            def build():
+                if self._load_translation(code):
+                    self._notices.put(f"Translating to {LANGUAGES[code].name}")
+            threading.Thread(target=build, daemon=True).start()
 
     def _render_loop(self):
         """Round-robins the GPU across every peer that has a fresh motion vector.
@@ -488,9 +596,12 @@ class ConferenceApp:
 
     async def _remove_peer(self, peer_id: str):
         peer = self.peers.pop(peer_id, None)
-        self.remotes.pop(peer_id, None)
+        remote = self.remotes.pop(peer_id, None)
+        if remote is not None and remote.translation is not None:
+            remote.translation.close()
         if self.speaker is not None:
             self.speaker.drop(peer_id)
+            self.speaker.drop(peer_id + VOICE_SUFFIX)
         if peer is not None:
             await peer.close()
 
@@ -577,6 +688,8 @@ class ConferenceApp:
                 print("Re-calibrating neutral pose.")
             elif action == "preview":
                 self.set_self_preview(not self.self_preview)
+            elif action == "translate":
+                self.cycle_translation()
             elif action == "selfview":
                 self.self_view = "camera" if self.self_view == "avatar" else "avatar"
                 win.toast("Showing your camera" if self.self_view == "camera"
@@ -598,7 +711,17 @@ class ConferenceApp:
         on = self.self_preview
         label = "Preparing…" if self._self_building else f"Self preview: {'on' if on else 'off'}"
         toggle = ui.Control("P", label, "preview", "toggle_on" if on else "default")
-        return [toggle] + ([ui.SELF_VIEW_CONTROL] if on else []) + ui.CALL_CONTROLS
+        controls = [toggle] + ([ui.SELF_VIEW_CONTROL] if on else [])
+        if self.speaker is not None:
+            if self._translate_loading:
+                label = f"Preparing {LANGUAGES[self._translate_loading].name}…"
+            elif self.translate_to:
+                label = f"Translate: {LANGUAGES[self.translate_to].name}"
+            else:
+                label = "Translate: off"
+            controls.append(ui.Control("T", label, "translate",
+                                       "toggle_on" if self.translate_to else "default"))
+        return controls + ui.CALL_CONTROLS
 
     def _self_tile(self) -> ui.Tile:
         slot = self.self_slot.peek()
@@ -654,6 +777,9 @@ class ConferenceApp:
             subtitle = (f"video {v_kbps:.1f} kbps   audio {a_kbps:.1f} kbps   "
                         f"render {remote.render_ms:.0f} ms   lost {remote.lost}   "
                         f"a/v sync {sync}")
+            if self.translate_to and remote.translation is not None:
+                subtitle += (f"   → {self.translate_to} "
+                             f"lag {remote.translation.lag_ms / 1000:.1f} s")
         else:
             subtitle = ""
         return ui.Tile(title=remote.name, image=image, subtitle=subtitle,
@@ -672,7 +798,8 @@ class ConferenceApp:
         finally:
             self.running = False
             thread.join(timeout=5.0)
-            self.camera.close()
+            if self.camera is not None:
+                self.camera.close()
             if self.mic is not None:
                 self.mic.close()
             if self.speaker is not None:
@@ -742,7 +869,10 @@ def parse_args(argv=None):
                    help="TURN password (or set TURN_PASS)")
 
     g = p.add_argument_group("video")
-    g.add_argument("--camera", "-c", type=int, default=0)
+    g.add_argument("--camera", "-c", type=int, default=0,
+                   help="Camera index, or -1 to run without one (no video sent or "
+                        "shown for you; useful for a second, listen-only client on "
+                        "a machine with only one camera)")
     g.add_argument("--width", type=int, default=640)
     g.add_argument("--height", type=int, default=480)
     g.add_argument("--fps", type=int, default=20, help="Motion vectors sent per second")
@@ -774,8 +904,42 @@ def parse_args(argv=None):
     g.add_argument("--output-device", type=int, default=None)
     g.add_argument("--list-devices", action="store_true")
 
+    g = p.add_argument_group("translation (English speech, translated on the receiving side)")
+    g.add_argument("--translate", choices=sorted(LANGUAGES), default=None,
+                   help="Start the call hearing everyone in this language")
+    g.add_argument("--translate-langs", nargs="+", choices=sorted(LANGUAGES),
+                   default=["es", "fr"],
+                   help="Languages the T key cycles through, after off")
+    g.add_argument("--asr-model", default="small",
+                   help="faster-whisper model: tiny, base, small, small.en, medium, …")
+    g.add_argument("--mt-model", choices=["base", "big"], default="base",
+                   help="Opus-MT size; `big` (transformer-big, es/fr/it) is ~3x the "
+                        "download for a modest gain")
+    g.add_argument("--asr-device", choices=["auto", "cuda", "cpu"], default="auto",
+                   help="Where Whisper runs; the GPU cuts ~1.5 s of lag (default: GPU "
+                        "if there is one, unless --cpu)")
+    g.add_argument("--translate-threads", type=int, default=4,
+                   help="CPU threads for speech recognition")
+    g.add_argument("--tts", choices=["piper", "pocket"], default="piper",
+                   help="Speech synthesis engine for the translated voice: `piper` "
+                        "(one fixed voice per language) or `pocket` (Kyutai's "
+                        "Pocket TTS, voice-cloned from --voice-reference, runs on CPU)")
+    g.add_argument("--voice-reference", default=None,
+                   help="Wav file, named Pocket TTS voice (e.g. alba), or "
+                        "hf://kyutai/tts-voices/... path to clone — `--tts pocket` only "
+                        f"(default: the bundled voice '{DEFAULT_POCKET_VOICE}')")
+    g.add_argument("--pocket-device", choices=["auto", "cuda", "cpu"], default="auto",
+                   help="`--tts pocket` only; auto stays on CPU (GPU use is unofficial)")
+    g.add_argument("--pocket-quantize", action="store_true",
+                   help="`--tts pocket` only; int8 dynamic quantization on CPU "
+                        "(smaller/faster, same quality)")
+
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv)
+    if args.cpu and args.asr_device == "auto":
+        args.asr_device = "cpu"
+    if args.translate and args.translate not in args.translate_langs:
+        args.translate_langs.insert(0, args.translate)
     return args
 
 

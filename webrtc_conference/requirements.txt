@@ -5,3 +5,20 @@ aiohttp>=3.9
 encodec>=0.1.1
 sounddevice>=0.4.6
 PySide6>=6.5
+
+# Optional: speech translation on the receiving side (T in the call).
+#   pip install faster-whisper ctranslate2 transformers sentencepiece pathvalidate huggingface_hub
+#   pip install --no-deps piper-tts
+# --no-deps because piper-tts asks for the CPU `onnxruntime` wheel, which would
+# replace the `onnxruntime-gpu` LivePortrait uses; the GPU wheel serves it too.
+# Turn detection (translator.py's TurnDetector, pipecat-ai/smart-turn) reuses
+# onnxruntime, transformers and huggingface_hub already pulled in above —
+# no extra package needed, just a one-time ~9 MB model download.
+#
+# Optional: --tts pocket, a voice-cloned alternative to the Piper voice above
+# (see translator.py's PocketTTSVoice). Runs on CPU; not needed for --tts piper.
+#   pip install pocket-tts
+# On Linux this pulls PyTorch's CUDA wheels by default even though Pocket TTS
+# runs on CPU (adds a few GB for nothing); use
+#   pip install pocket-tts --extra-index-url https://download.pytorch.org/whl/cpu
+# to avoid that.
