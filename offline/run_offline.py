@@ -139,6 +139,42 @@ class VideoWriter:
             raise RuntimeError("ffmpeg video encode failed")
 
 
+def fixed_box_encoder(MotionEncoder):
+    """MotionEncoder whose crop is fixed from the first frame with a face, as
+    the FYP_SemCon transmitter does, instead of following the face every frame.
+    The tracked crop moves with the head (and re-snaps at every re-detection),
+    which removes real head motion and adds jitter; a fixed box keeps the head
+    moving inside the crop, so that motion travels as pose/translation."""
+
+    class FixedBoxEncoder(MotionEncoder):
+        def __init__(self, engine):
+            super().__init__(engine, crop_driving=True)
+            self._m_o2c = None
+            self._dsize = engine.crop_cfg.dsize
+
+        def reset_tracking(self):
+            super().reset_tracking()
+            self._m_o2c = None
+
+        def _crop(self, frame_bgr):
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if self._m_o2c is None:
+                try:
+                    with self.engine.lock:
+                        info = self.engine.cropper.crop_source_image(frame_rgb, self.engine.crop_cfg)
+                except Exception:
+                    info = None
+                if info is None:
+                    return None
+                self._m_o2c = np.asarray(info["M_o2c"], dtype=np.float64)[:2]
+                return info["img_crop_256x256"]
+            crop = cv2.warpAffine(frame_rgb, self._m_o2c, (self._dsize, self._dsize),
+                                  flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+            return cv2.resize(crop, (256, 256), interpolation=cv2.INTER_AREA)
+
+    return FixedBoxEncoder
+
+
 def stats_ms(values):
     if not values:
         return None
@@ -204,6 +240,9 @@ def main():
     g = ap.add_argument_group("video (client.py defaults)")
     g.add_argument("--fps", type=float, default=20, help="motion vectors per second")
     g.add_argument("--det-interval", type=int, default=30)
+    g.add_argument("--driving-crop", choices=("track", "fixed"), default="track",
+                   help="track: their crop, follows the face every frame (re-detects every "
+                        "--det-interval); fixed: box fixed from the first face (FYP_SemCon transmitter)")
     g.add_argument("--no-crop", action="store_true",
                    help="skip face detection (face already fills the frame)")
     g.add_argument("--no-crop-avatar", action="store_true",
@@ -251,6 +290,11 @@ def main():
 
     print(f"video {args.video.name}: {n_src} frames @ {src_fps:.2f} fps -> "
           f"{n_out} frames @ {args.fps:g} fps ({duration:.1f} s)")
+    ratio = src_fps / args.fps
+    if abs(ratio - round(ratio)) > 1e-3:
+        print(f"  note: {src_fps:g} -> {args.fps:g} fps is not a whole-frame step ({ratio:.2f}); "
+              f"frames are taken unevenly and motion will judder. Use --fps "
+              f"{src_fps / max(1, int(ratio)):g} or {src_fps / (int(ratio) + 1):g} for even steps.")
     t_start = time.perf_counter()
 
     # ── audio ───────────────────────────────────────────────────────────────
@@ -275,8 +319,11 @@ def main():
     # ── models ──────────────────────────────────────────────────────────────
     t0 = time.perf_counter()
     engine = LivePortraitEngine(force_cpu=args.cpu, half=True)
-    encoder = MotionEncoder(engine, det_interval=args.det_interval,
-                            crop_driving=not args.no_crop)
+    if args.driving_crop == "fixed" and not args.no_crop:
+        encoder = fixed_box_encoder(MotionEncoder)(engine)
+    else:
+        encoder = MotionEncoder(engine, det_interval=args.det_interval,
+                                crop_driving=not args.no_crop)
     load_s = time.perf_counter() - t0
 
     # Portrait: JPEG round trip exactly as the blob channel would carry it.
@@ -385,6 +432,7 @@ def main():
     summary = {
         "video": str(args.video), "audio": str(args.audio or args.video),
         "avatar": str(args.avatar) if args.avatar else "first video frame",
+        "driving_crop": "none" if args.no_crop else args.driving_crop,
         "frames": n_written, "fps": args.fps, "seconds": round(clip_s, 2),
         "motion": {
             "packets_sent": len(packets), "no_face_frames": no_face,
