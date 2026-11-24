@@ -2,17 +2,17 @@
 """
 One WebRTC connection to one remote participant.
 
-No RTP media sections are negotiated at all — everything rides four out-of-band
+No RTP media sections are negotiated at all — everything rides three out-of-band
 (pre-negotiated) SCTP DataChannels with fixed stream ids, so both ends agree on
 the layout without DCEP round-trips:
 
   id 1  ctrl    reliable, ordered      JSON control messages
   id 2  blob    reliable, ordered      chunked avatar JPEG
   id 3  motion  unreliable, unordered  150-byte motion vectors, drop on loss
-  id 4  audio   time-bounded, ordered  EnCodec chunks, useless once late
 
-Motion and audio are deliberately lossy: retransmitting a 40 ms-old frame costs
-more than skipping it.
+Audio is not carried here: it goes through the translation server as Opus
+(see audio_relay.py). The motion channel is deliberately lossy: retransmitting a
+50 ms-old pose costs more than skipping it.
 """
 
 import asyncio
@@ -31,8 +31,7 @@ from . import protocol as P
 
 log = logging.getLogger("peer")
 
-CH_CTRL, CH_BLOB, CH_MOTION, CH_AUDIO = 1, 2, 3, 4
-AUDIO_LIFETIME_MS = 300
+CH_CTRL, CH_BLOB, CH_MOTION = 1, 2, 3
 MOTION_BACKPRESSURE_BYTES = 64 * 1024
 
 
@@ -115,7 +114,7 @@ class LinkStats:
 
 
 class NeuralPeer:
-    """Wraps an RTCPeerConnection plus its four channels for a single remote peer."""
+    """Wraps an RTCPeerConnection plus its three channels for a single remote peer."""
 
     def __init__(self, peer_id: str, name: str, is_offerer: bool,
                  send_signal: Callable[[str, dict], Awaitable[None]],
@@ -138,13 +137,9 @@ class NeuralPeer:
             "blob", negotiated=True, id=CH_BLOB, ordered=True)
         self.motion = self.pc.createDataChannel(
             "motion", negotiated=True, id=CH_MOTION, ordered=False, maxRetransmits=0)
-        self.audio = self.pc.createDataChannel(
-            "audio", negotiated=True, id=CH_AUDIO, ordered=True,
-            maxPacketLifeTime=AUDIO_LIFETIME_MS)
 
         # Injected by the application.
         self.on_motion: Callable[[str, P.MotionPacket], None] = lambda pid, pkt: None
-        self.on_audio: Callable[[str, P.AudioPacket], None] = lambda pid, pkt: None
         self.on_avatar: Callable[[str, bytes], None] = lambda pid, data: None
         self.on_ctrl: Callable[[str, dict], None] = lambda pid, msg: None
         self.on_state: Callable[[str, str], None] = lambda pid, state: None
@@ -166,7 +161,7 @@ class NeuralPeer:
 
     @property
     def channels(self):
-        return (self.ctrl, self.blob, self.motion, self.audio)
+        return (self.ctrl, self.blob, self.motion)
 
     def _wire_channels(self):
         # The channels are negotiated out-of-band, so they all flip to "open"
@@ -207,18 +202,6 @@ class NeuralPeer:
                 return
             self.stats_rx.add_motion(len(message))
             self.on_motion(self.peer_id, pkt)
-
-        @self.audio.on("message")
-        def _audio(message):
-            if not isinstance(message, bytes):
-                return
-            try:
-                pkt = P.unpack_audio(message)
-            except ValueError as exc:
-                log.debug("[%s] dropping audio packet: %s", self.name, exc)
-                return
-            self.stats_rx.add_audio(len(message))
-            self.on_audio(self.peer_id, pkt)
 
     def _maybe_open(self):
         if self._channels_open or any(c.readyState != "open" for c in self.channels):
@@ -279,13 +262,6 @@ class NeuralPeer:
             return False                     # congested: skip rather than queue
         self.motion.send(payload)
         self.stats_tx.add_motion(len(payload))
-        return True
-
-    def send_audio(self, payload: bytes) -> bool:
-        if self.audio.readyState != "open":
-            return False
-        self.audio.send(payload)
-        self.stats_tx.add_audio(len(payload))
         return True
 
     async def close(self):

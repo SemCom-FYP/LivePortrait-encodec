@@ -209,7 +209,18 @@ That is 70 values × 2 bytes = 140 bytes, plus a 10-byte header, for a fixed
 that against roughly 369 kbps for H.264 at 640×480 and 20 fps — a rough yardstick
 rather than a measurement, but the order of magnitude is the point.
 
-## Audio path: EnCodec
+> **Current audio path (supersedes this section and the `audio` datachannel in the
+> table above):** voice no longer rides the datachannels or uses EnCodec. Each client
+> sends 20 ms **Opus** packets (24 kHz mono, `--opus-kbps`, default 24) to the
+> translation server (`--translate-server`, default `ws://192.248.10.47:8770/v1/conf`),
+> which forwards them to the other participants untouched, or translates them first for
+> a listener who asked for another language (`T`, `--translate`). Every packet keeps the
+> sender's capture `t_ms`, so the audio-playhead sync below works unchanged; for a
+> translated voice the server stamps packets with when the source speech began plus the
+> offset into the translation. See `audio_relay.py` and `translation_server/src/conference.py`.
+> Video (motion vectors, portrait) is still direct peer-to-peer.
+
+## Audio path: EnCodec (replaced, kept for reference)
 
 EnCodec's 24 kHz model is not a streaming codec — it has no framing of its own —
 so it is driven in fixed chunks and the raw quantiser codes go straight onto the

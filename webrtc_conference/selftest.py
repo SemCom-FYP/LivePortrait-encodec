@@ -6,10 +6,10 @@ End-to-end verification without a second machine, camera or microphone.
 
 Stage 1  wire format round-trips
 Stage 2  A/V sync: a whole call stepped through the playout buffer
-Stage 3  EnCodec encode -> pack -> unpack -> decode on synthetic speech
+Stage 3  Opus encode -> decode on synthetic speech (the voice path's codec)
 Stage 4  LivePortrait motion extract -> pack -> unpack -> render
-Stage 5  two real aiortc peers over loopback, exchanging an avatar, a burst of
-         motion vectors and a burst of audio through the actual datachannels
+Stage 5  two real aiortc peers over loopback, exchanging an avatar and a burst of
+         motion vectors through the actual datachannels (audio goes via the server)
 Stage 6  two clients meeting through the real signaling server
 """
 
@@ -23,7 +23,6 @@ import cv2
 import numpy as np
 
 from . import protocol as P
-from .audio_codec import SAMPLE_RATE, EncodecStreamCodec
 from .media import AVSync, MotionJitterBuffer
 from .motion_codec import (AvatarRenderer, LivePortraitEngine, MotionEncoder,
                            decode_avatar_jpeg, encode_avatar_jpeg, load_avatar_rgb)
@@ -164,35 +163,32 @@ def stage_sync():
 
 # ── stage 3 ───────────────────────────────────────────────────────────────────
 
-def stage_audio(bandwidth: float, chunk_ms: int, device: str):
-    print(f"\nStage 3: EnCodec  (bandwidth={bandwidth} kbps, chunk={chunk_ms} ms)")
-    codec = EncodecStreamCodec(bandwidth=bandwidth, device=device, chunk_ms=chunk_ms)
-    check("quantiser configured", codec.n_q > 0,
-          f"n_q={codec.n_q}, nominal {codec.nominal_kbps:.1f} kbps")
+def stage_audio(kbps: float):
+    print(f"\nStage 3: Opus voice codec  (24 kHz, 20 ms packets, {kbps:g} kbps)")
+    try:
+        from .opus_codec import FRAME_SAMPLES, SAMPLE_RATE, OpusDecoder, OpusEncoder
+        enc, dec = OpusEncoder(kbps), OpusDecoder()
+    except Exception as exc:
+        check("Opus available (pip install PyOgg)", False, str(exc))
+        return
 
-    mic_sr = 48000
-    n = int(mic_sr * chunk_ms / 1000)
-    t = np.arange(n) / mic_sr
+    n_frames = 50
+    t = np.arange(FRAME_SAMPLES * n_frames) / SAMPLE_RATE
     speechy = (0.3 * np.sin(2 * np.pi * 140 * t)
                * (1 + 0.5 * np.sin(2 * np.pi * 3 * t))).astype(np.float32)
 
-    sizes, enc_ms, dec_ms = [], [], []
-    for i in range(5):
-        codes = codec.encode(speechy, mic_sr)
-        wire = P.pack_audio(i, i * chunk_ms, codes)
-        pcm = codec.decode(P.unpack_audio(wire).codes)
-        sizes.append(len(wire))
-        enc_ms.append(codec.stats.encode_ms)
-        dec_ms.append(codec.stats.decode_ms)
+    sizes, decoded = [], []
+    for i in range(n_frames):
+        packet = enc.encode(speechy[i * FRAME_SAMPLES:(i + 1) * FRAME_SAMPLES])
+        sizes.append(len(packet))
+        decoded.append(dec.decode(packet))
+    pcm = np.concatenate(decoded)
 
-    wire_kbps = np.mean(sizes) * 8 / (chunk_ms / 1000) / 1000
-    budget = chunk_ms
-    check("wire bitrate near nominal", abs(wire_kbps - codec.nominal_kbps) < 1.5,
-          f"{wire_kbps:.2f} kbps on the wire vs {codec.nominal_kbps:.2f} nominal")
-    check("codec keeps up with real time",
-          np.mean(enc_ms) + np.mean(dec_ms) < budget,
-          f"encode {np.mean(enc_ms):.0f} ms + decode {np.mean(dec_ms):.0f} ms "
-          f"per {chunk_ms} ms chunk")
+    check("one 20 ms frame back per packet",
+          all(d.size == FRAME_SAMPLES for d in decoded), f"{pcm.size} samples")
+    kbps_actual = np.mean(sizes) * 8 / (FRAME_SAMPLES / SAMPLE_RATE) / 1000
+    check("bitrate near the target", kbps_actual < kbps * 1.6,
+          f"{kbps_actual:.1f} kbps vs {kbps:g} target")
     check("decoded audio is finite and non-silent",
           np.isfinite(pcm).all() and float(np.abs(pcm).max()) > 0.01,
           f"peak {np.abs(pcm).max():.3f}")
@@ -275,7 +271,7 @@ async def stage_transport(source: str):
     print("\nStage 5: aiortc loopback over real datachannels")
     a_to_b: asyncio.Queue = asyncio.Queue()
     b_to_a: asyncio.Queue = asyncio.Queue()
-    received = {"avatar": None, "motion": [], "audio": [], "ctrl": []}
+    received = {"avatar": None, "motion": [], "ctrl": []}
 
     async def send_a(_to, data):
         await a_to_b.put(data)
@@ -288,7 +284,6 @@ async def stage_transport(source: str):
 
     bob.on_avatar = lambda pid, d: received.__setitem__("avatar", d)
     bob.on_motion = lambda pid, p: received["motion"].append(p)
-    bob.on_audio = lambda pid, p: received["audio"].append(p)
     bob.on_ctrl = lambda pid, m: received["ctrl"].append(m)
 
     async def pump(q, peer):
@@ -313,11 +308,11 @@ async def stage_transport(source: str):
         return
 
     await asyncio.sleep(0.3)
-    check("all four channels open",
+    check("all three channels open",
           all(c.readyState == "open"
-              for c in (alice.ctrl, alice.blob, alice.motion, alice.audio)),
+              for c in (alice.ctrl, alice.blob, alice.motion)),
           ", ".join(f"{c.label}={c.readyState}"
-                    for c in (alice.ctrl, alice.blob, alice.motion, alice.audio)))
+                    for c in (alice.ctrl, alice.blob, alice.motion)))
 
     jpeg = encode_avatar_jpeg(load_avatar_rgb(source))
     alice.send_ctrl({"type": "hello", "name": "Alice"})
@@ -331,15 +326,11 @@ async def stage_transport(source: str):
             np.zeros(3, np.float32),
             (rng.standard_normal((21, 3)) * 0.02).astype(np.float32),
             calibrate=(i == 0)))
-        if i % 5 == 0:
-            alice.send_audio(P.pack_audio(
-                i // 5, i * 50, rng.integers(0, 1024, size=(8, 18))))
         await asyncio.sleep(0.01)
 
     for _ in range(50):
         await asyncio.sleep(0.1)
-        if (received["avatar"] and len(received["motion"]) >= n_motion
-                and len(received["audio"]) >= 10):
+        if received["avatar"] and len(received["motion"]) >= n_motion:
             break
 
     check("avatar arrived intact over the reliable channel",
@@ -348,15 +339,13 @@ async def stage_transport(source: str):
           any(m.get("type") == "hello" for m in received["ctrl"]))
     check("motion vectors arrived", len(received["motion"]) >= n_motion * 0.9,
           f"{len(received['motion'])}/{n_motion}")
-    check("audio chunks arrived", len(received["audio"]) >= 9,
-          f"{len(received['audio'])}/10")
     if received["motion"]:
         check("first motion packet carries the calibrate flag",
               received["motion"][0].calibrate)
 
-    v_kbps, a_kbps = bob.stats_rx.kbps()
-    print(f"  measured over the link: video {v_kbps:.1f} kbps, "
-          f"audio {a_kbps:.1f} kbps (at the synthetic send rate)")
+    v_kbps, _ = bob.stats_rx.kbps()
+    print(f"  measured over the link: video {v_kbps:.1f} kbps "
+          f"(at the synthetic send rate)")
 
     for t in pumps:
         t.cancel()
@@ -478,9 +467,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Self-test for the neural conference stack")
     p.add_argument("--source", default=DEFAULT_SOURCE)
     p.add_argument("--driving", default=DEFAULT_DRIVING)
-    p.add_argument("--bandwidth", type=float, default=6.0)
-    p.add_argument("--audio-chunk-ms", type=int, default=240)
-    p.add_argument("--audio-device", default="cpu")
+    p.add_argument("--opus-kbps", type=float, default=24.0)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--out", default="selftest_out")
     p.add_argument("--skip", nargs="*", default=[],
@@ -494,7 +481,7 @@ def main(argv=None):
     if "sync" not in args.skip:
         stage_sync()
     if "audio" not in args.skip:
-        stage_audio(args.bandwidth, args.audio_chunk_ms, args.audio_device)
+        stage_audio(args.opus_kbps)
     if "video" not in args.skip:
         stage_video(args.source, args.driving, args.out, args.cpu)
     if "transport" not in args.skip:

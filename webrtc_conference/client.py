@@ -15,11 +15,12 @@ do not control. Motion and audio both carry the sender's capture timestamp,
 and motion waits in a per-peer queue until the instant it was captured comes
 up on that peer's audio playhead — see AVSync and MotionJitterBuffer.
 
-Translation (T in the call, or --translate es): each peer's decoded voice
-goes to a PeerTranslation instead of the speaker, and its translated speech
-plays in place of the original — see translator.py. The motion clock keeps
-running as if the original were playing, so faces stay live and the
-translated voice follows a phrase behind.
+Audio goes through the translation server as Opus, not over the datachannels —
+see audio_relay.py. The server forwards a voice untouched, or translates it
+first when this listener asked for another language (T in the call, or
+--translate es). Every voice packet keeps the sender's capture timestamp, so a
+speaker's video is still rendered against the voice you actually hear, original
+or translated.
 """
 
 import argparse
@@ -39,7 +40,8 @@ from aiortc import RTCIceServer
 
 from . import protocol as P
 from . import ui
-from .audio_codec import SAMPLE_RATE, CrossfadeJoiner, EncodecStreamCodec
+from .audio_relay import DEFAULT_SERVER, AudioRelay, lang_name
+from .opus_codec import SAMPLE_RATE
 from .media import (AVSync, CameraReader, LatestSlot, MicReader,
                     MotionJitterBuffer, SpeakerMixer, list_devices,
                     probe_input_rate)
@@ -47,8 +49,6 @@ from .motion_codec import (AvatarRenderer, LivePortraitEngine, MotionEncoder,
                            decode_avatar_jpeg, encode_avatar_jpeg, load_avatar_rgb)
 from .peer import DEFAULT_STUN, NeuralPeer, RateMeter, build_ice_servers
 from .signaling import DEFAULT_PORT, SignalingClient
-from .translator import (DEFAULT_POCKET_VOICE, LANGUAGES, VOICE_BUFFER_S, VOICE_SUFFIX,
-                         PeerTranslation, PocketTTSVoice, SpeechTranslator)
 
 log = logging.getLogger("client")
 
@@ -63,6 +63,11 @@ EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 # more noticeable than video that trails it (ITU-R BT.1359 puts the bounds at
 # roughly +45 ms against -125 ms).
 AV_SYNC_SLACK_MS = 10
+
+# Translated speech comes back in bursts faster than it plays, so its ring buffer
+# has to hold a whole utterance rather than the default 1.5 s.
+VOICE_BUFFER_S = 30.0
+MIC_CHUNK_MS = 20            # one Opus frame
 
 # Cycle for the "Render" control (D): 1 decodes every due packet, N>1 decodes
 # only every Nth and reuses the previous frame otherwise — see webcam_inference.py's
@@ -79,11 +84,12 @@ class RemoteState:
     renderer: Optional[AvatarRenderer] = None
     avatar_jpeg: Optional[bytes] = None
     status: str = "connecting…"
-    pending_motion: MotionJitterBuffer = field(default_factory=MotionJitterBuffer)
-    audio_q: "queue.Queue[P.AudioPacket]" = field(default_factory=lambda: queue.Queue(maxsize=8))
-    joiner: CrossfadeJoiner = field(default_factory=CrossfadeJoiner)
+    # Deep enough to hold the motion that arrives while a translated voice is
+    # still on its way: the face waits for the voice it is lip-syncing to.
+    pending_motion: MotionJitterBuffer = field(
+        default_factory=lambda: MotionJitterBuffer(maxlen=400))
     av_sync: AVSync = field(default_factory=AVSync)
-    translation: Optional[PeerTranslation] = None
+    voice_translated: bool = False       # the voice you hear from them is translated
     sync_drift_ms: float = 0.0
     frames_rendered: int = 0
     render_ms: float = 0.0
@@ -100,9 +106,9 @@ class ConferenceApp:
         self.remotes: dict[str, RemoteState] = {}
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.signaling: Optional[SignalingClient] = None
+        self._relay_task: Optional[asyncio.Task] = None
 
         self._motion_seq = 0
-        self._audio_seq = 0
         self._calibrate_next = True
         self._tx_video = RateMeter()
         self._tx_audio = RateMeter()
@@ -148,53 +154,40 @@ class ConferenceApp:
         self._self_frames = 0
         self._self_render_ms = 0.0
 
-        # Audio
-        self.audio_codec: Optional[EncodecStreamCodec] = None
+        # Audio: Opus through the translation server (audio_relay.py). The relay
+        # is built now so a missing Opus library fails at start, and connects once
+        # signaling has told us our id.
+        self.relay: Optional[AudioRelay] = None
         self.speaker: Optional[SpeakerMixer] = None
         self.mic: Optional[MicReader] = None
-        self._mic_q: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue(maxsize=4)
+        self.translate_to: Optional[str] = args.translate      # language heard now
         if not args.no_audio:
-            print(f"  loading EnCodec ({args.bandwidth} kbps, {args.audio_device}) …")
-            self.audio_codec = EncodecStreamCodec(
-                bandwidth=args.bandwidth, device=args.audio_device,
-                chunk_ms=args.audio_chunk_ms)
-            self.decode_codec = EncodecStreamCodec(
-                bandwidth=args.bandwidth, device=args.audio_device,
-                chunk_ms=args.audio_chunk_ms)
+            print(f"  audio: Opus {args.opus_kbps:g} kbps via {args.translate_server}")
+            self.relay = AudioRelay(
+                args.translate_server, args.room, args.name, speaks=args.speaks,
+                hear=self.translate_to, token=args.translate_token,
+                bitrate_kbps=args.opus_kbps, transport=args.voice_transport,
+                ice_servers=self.ice_servers, on_voice=self._on_voice,
+                on_tx=self._tx_audio.add, on_rx=self._on_voice_rx,
+                on_notice=self._notices.put)
             self.speaker = SpeakerMixer(SAMPLE_RATE, device=args.output_device)
-
-        # Translation: built on first use, since Whisper and each language's
-        # models take seconds to load (and a download the first time).
-        self.translator: Optional[SpeechTranslator] = None
-        self.translate_to: Optional[str] = None     # language being heard now
-        self._translate_loading: Optional[str] = None
-        # Only used when --tts pocket: one cloned voice, shared across every
-        # peer's translated speech and every target language (see
-        # translator.PocketTTSVoice — one checkpoint per language, all
-        # cloned to the same reference clip).
-        self.pocket_voice: Optional[PocketTTSVoice] = None
-        if args.translate and self.audio_codec is not None:
-            print(f"  loading translation to {LANGUAGES[args.translate].name} …")
-            self._load_translation(args.translate)
 
     # ── threads ──────────────────────────────────────────────────────────────
 
     def start_workers(self):
         for target in (self._capture_loop, self._render_loop):
             threading.Thread(target=target, daemon=True).start()
-        if self.audio_codec is not None:
-            threading.Thread(target=self._audio_encode_loop, daemon=True).start()
-            threading.Thread(target=self._audio_decode_loop, daemon=True).start()
+        if self.relay is not None:
             self.speaker.start()
-            chunk_ms = self.args.audio_chunk_ms
             rate = probe_input_rate(self.args.input_device)
+            self.relay.mic_rate = rate
             self.mic = MicReader(
                 self._on_mic_chunk,
-                chunk_samples=int(rate * chunk_ms / 1000),
+                chunk_samples=int(rate * MIC_CHUNK_MS / 1000),
                 device=self.args.input_device, sample_rate=rate)
             self.mic.start()
             print(f"  mic: {self.mic.name} @ {self.mic.sample_rate} Hz, "
-                  f"{chunk_ms} ms chunks")
+                  f"{MIC_CHUNK_MS} ms chunks")
 
     def _capture_loop(self):
         """Webcam -> motion vector -> every peer."""
@@ -253,134 +246,56 @@ class ConferenceApp:
         # The callback only fires once the whole block has been captured, so
         # "now" is the *end* of the window. The wire timestamp marks the first
         # sample instead, which is the one the far side hears first — stamping
-        # it "now" would hand every chunk to the receiver a whole chunk late
-        # and let video run that far ahead of the voice.
+        # it "now" would hand every chunk to the receiver late and let video run
+        # ahead of the voice.
         span_ms = pcm.size / self.mic.sample_rate * 1000
         t_ms = int(time.monotonic() * 1000 - span_ms) & 0xFFFFFFFF
-        try:
-            self._mic_q.put_nowait((t_ms, pcm))
-        except queue.Full:
-            pass                                    # mic outran the encoder; drop
+        self.relay.send_mic(pcm, t_ms)              # encodes + hands off; never blocks
 
-    def _audio_encode_loop(self):
-        while self.running:
-            try:
-                t_ms, pcm = self._mic_q.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            try:
-                codes = self.audio_codec.encode(pcm, self.mic.sample_rate)
-            except Exception as exc:
-                log.warning("audio encode failed: %s", exc)
-                continue
-            payload = P.pack_audio(self._audio_seq, t_ms, codes)
-            self._audio_seq += 1
-            self._tx_audio.add(len(payload))
-            if self.loop is not None:
-                for peer in list(self.peers.values()):
-                    self.loop.call_soon_threadsafe(_swallow, peer.send_audio, payload)
+    def _on_voice(self, peer_id: str, t_ms: int, pcm: np.ndarray, translated: bool):
+        """A decoded voice packet from the server (event-loop thread).
 
-    def _audio_decode_loop(self):
-        while self.running:
-            work = False
-            for remote in list(self.remotes.values()):
-                try:
-                    pkt = remote.audio_q.get_nowait()
-                except queue.Empty:
-                    continue
-                work = True
-                try:
-                    pcm = self.decode_codec.decode(pkt.codes)
-                except Exception as exc:
-                    log.debug("audio decode failed: %s", exc)
-                    continue
-                if self.translate_to is not None:
-                    self._feed_translation(remote, pkt.t_ms, remote.joiner.push(pcm))
-                    continue
-                # Measured before the push, so it counts only what has to play
-                # out first; the device's own buffering sits behind that again
-                # and is large enough on Windows to matter for lip sync.
-                delay_ms = (self.speaker.backlog_ms(remote.peer_id)
-                            + self.speaker.output_latency_ms)
-                remote.av_sync.note_audio_push(pkt.t_ms, delay_ms)
-                self.speaker.push(remote.peer_id, remote.joiner.push(pcm))
-            if not work:
-                time.sleep(0.005)
+        `t_ms` is the sender's capture clock: the packet's own for an original
+        voice, the source speech's for a translated one. Pushing it into the
+        peer's ring buffer and anchoring `t_ms` to the moment it becomes audible
+        is what tells the renderer which of that peer's motion packets belongs
+        to the sound now coming out of the speaker."""
+        if self.speaker is None:
+            return
+        remote = self.remotes.get(peer_id)
+        if remote is not None:
+            if translated != remote.voice_translated:
+                remote.voice_translated = translated
+                self.speaker.drop(peer_id)          # cut the other version's backlog
+            # Measured before the push, so it counts only what has to play out
+            # first; the device's own buffering sits behind that again and is
+            # large enough on Windows to matter for lip sync.
+            delay_ms = self.speaker.backlog_ms(peer_id) + self.speaker.output_latency_ms
+            remote.av_sync.note_audio_push(t_ms, delay_ms)
+        self.speaker.push(peer_id, pcm, cap_s=VOICE_BUFFER_S if translated else None)
 
-    def _feed_translation(self, remote: RemoteState, t_ms: int, pcm: np.ndarray):
-        if remote.translation is None:
-            key = remote.peer_id + VOICE_SUFFIX
-            remote.translation = PeerTranslation(
-                self.translator, remote.name, self.translate_to,
-                out=lambda p, k=key: self.speaker.push(k, p, cap_s=VOICE_BUFFER_S),
-                backlog_ms=lambda k=key: self.speaker.backlog_ms(k),
-                speak_fn=self.pocket_voice.speak if self.pocket_voice is not None else None)
-        remote.translation.feed(pcm)
-        # Nothing of the original is queued for this peer, so run the motion
-        # clock as if it were playing with no backlog: the face stays live and
-        # the translated voice follows a phrase behind it.
-        remote.av_sync.note_audio_push(t_ms, self.speaker.output_latency_ms)
-
-    def _load_translation(self, code: str) -> bool:
-        """Whisper once, then this language's MT model and voice."""
-        try:
-            if self.translator is None:
-                self.translator = SpeechTranslator(
-                    self.args.asr_model, device=self.args.asr_device,
-                    threads=self.args.translate_threads, mt_size=self.args.mt_model,
-                    load_tts=(self.args.tts == "piper"))
-                log.info("speech recognition: whisper %s on %s",
-                         self.args.asr_model, self.translator.asr_device)
-            if self.args.tts == "pocket" and self.pocket_voice is None:
-                print(f"  loading Pocket TTS ({self.args.pocket_device}) …")
-                self.pocket_voice = PocketTTSVoice(
-                    device=self.args.pocket_device, quantize=self.args.pocket_quantize)
-                self.pocket_voice.clone(self.args.voice_reference or DEFAULT_POCKET_VOICE)
-            self.translator.prepare(code)
-        except Exception as exc:
-            self._notices.put(f"Can't translate to {LANGUAGES[code].name}: {exc}")
-            log.warning("translation unavailable: %s", exc)
-            return False
-        finally:
-            self._translate_loading = None
-        self._set_translation(code)
-        return True
-
-    def _set_translation(self, code: Optional[str]):
-        """Switch every peer to `code`, or back to their own voices with None."""
-        self.translate_to = code
-        for remote in list(self.remotes.values()):
-            if remote.translation is not None:
-                remote.translation.set_target(code)
-            # Whichever voice is going out is cut now rather than finishing
-            # the backlog it already had queued.
-            self.speaker.drop(remote.peer_id + VOICE_SUFFIX if code is None
-                              else remote.peer_id)
+    def _on_voice_rx(self, peer_id: str, nbytes: int):
+        peer = self.peers.get(peer_id)
+        if peer is not None:
+            peer.stats_rx.add_audio(nbytes)
 
     def cycle_translation(self):
-        """T in the call: off, then each --translate-langs language, then off."""
-        if self.speaker is None:
+        """T in the call: originals, then each --translate-langs language, then back.
+
+        Nothing is loaded here: the server does the translating, and this only
+        tells it which language this listener wants to hear."""
+        if self.relay is None:
             self._notices.put("Translation needs audio (started with --no-audio)")
-            return
-        if self._translate_loading:
             return
         order = [None] + list(self.args.translate_langs)
         current = self.translate_to if self.translate_to in order else None
         code = order[(order.index(current) + 1) % len(order)]
-        if code is None:
-            self._set_translation(None)
-            self._notices.put("Translation off — original voices")
-        elif self.translator is not None and self.translator.is_ready(code):
-            self._set_translation(code)
-            self._notices.put(f"Translating to {LANGUAGES[code].name}")
-        else:
-            self._translate_loading = code
-            self._notices.put(f"Preparing {LANGUAGES[code].name} translation…")
-
-            def build():
-                if self._load_translation(code):
-                    self._notices.put(f"Translating to {LANGUAGES[code].name}")
-            threading.Thread(target=build, daemon=True).start()
+        self.translate_to = code
+        self.relay.set_hear(code)
+        for remote in list(self.remotes.values()):
+            self.speaker.drop(remote.peer_id)       # don't finish the old voice's backlog
+        self._notices.put("Translation off — original voices" if code is None
+                          else f"Translating to {lang_name(code)}")
 
     def cycle_decode_every(self):
         """D in the call: 1 -> 2 -> 3 -> 4 -> back to 1 (full rate)."""
@@ -528,15 +443,6 @@ class ConferenceApp:
             r.last_seq = pkt.seq
             r.pending_motion.put(pkt)
 
-        def on_audio(pid, pkt):
-            r = self.remotes.get(pid)
-            if r is None:
-                return
-            try:
-                r.audio_q.put_nowait(pkt)
-            except queue.Full:
-                pass
-
         def on_avatar(pid, data):
             r = self.remotes.get(pid)
             if r is None:
@@ -573,7 +479,6 @@ class ConferenceApp:
             self._greet(pid)
 
         peer.on_motion = on_motion
-        peer.on_audio = on_audio
         peer.on_avatar = on_avatar
         peer.on_ctrl = on_ctrl
         peer.on_state = on_state
@@ -602,7 +507,7 @@ class ConferenceApp:
             return
         peer.send_ctrl({"type": "hello", "name": self.args.name,
                         "client": "liveportrait-neural-conf",
-                        "bandwidth": self.args.bandwidth})
+                        "audio": "opus-relay"})
         peer.send_avatar(1, self.avatar_jpeg)
         log.info("[%s] sent hello + avatar (%.0f KiB)",
                  peer.name, len(self.avatar_jpeg) / 1024)
@@ -621,11 +526,8 @@ class ConferenceApp:
     async def _remove_peer(self, peer_id: str):
         peer = self.peers.pop(peer_id, None)
         remote = self.remotes.pop(peer_id, None)
-        if remote is not None and remote.translation is not None:
-            remote.translation.close()
         if self.speaker is not None:
             self.speaker.drop(peer_id)
-            self.speaker.drop(peer_id + VOICE_SUFFIX)
         if peer is not None:
             await peer.close()
 
@@ -639,6 +541,11 @@ class ConferenceApp:
         async def on_peers(peers):
             print(f"Joined room '{self.args.room}' as {self.args.name} "
                   f"({len(peers)} already present)")
+            if self.relay is not None and self.relay.loop is None:
+                # Our signaling id is also our audio id, so the other side can tie
+                # a voice from the server to the WebRTC peer whose video it matches.
+                self.relay.attach(self.loop, self.signaling.peer_id)
+                self._relay_task = asyncio.create_task(self.relay.run())
             for p in peers:
                 await self._add_peer(p["id"], p["name"], is_offerer=True)
 
@@ -668,6 +575,10 @@ class ConferenceApp:
             await asyncio.sleep(0.1)
         runner.cancel()
 
+        if self.relay is not None:
+            await self.relay.close()
+            if self._relay_task is not None:
+                self._relay_task.cancel()
         for pid in list(self.peers):
             await self._remove_peer(pid)
         await self.signaling.close()
@@ -739,10 +650,8 @@ class ConferenceApp:
         toggle = ui.Control("P", label, "preview", "toggle_on" if on else "default")
         controls = [toggle] + ([ui.SELF_VIEW_CONTROL] if on else [])
         if self.speaker is not None:
-            if self._translate_loading:
-                label = f"Preparing {LANGUAGES[self._translate_loading].name}…"
-            elif self.translate_to:
-                label = f"Translate: {LANGUAGES[self.translate_to].name}"
+            if self.translate_to:
+                label = f"Translate: {lang_name(self.translate_to)}"
             else:
                 label = "Translate: off"
             controls.append(ui.Control("T", label, "translate",
@@ -807,9 +716,8 @@ class ConferenceApp:
             subtitle = (f"video {v_kbps:.1f} kbps   audio {a_kbps:.1f} kbps   "
                         f"render {remote.render_ms:.0f} ms   lost {remote.lost}   "
                         f"a/v sync {sync}")
-            if self.translate_to and remote.translation is not None:
-                subtitle += (f"   → {self.translate_to} "
-                             f"lag {remote.translation.lag_ms / 1000:.1f} s")
+            if remote.voice_translated and self.translate_to:
+                subtitle += f"   → {self.translate_to}"
         else:
             subtitle = ""
         return ui.Tile(title=remote.name, image=image, subtitle=subtitle,
@@ -926,53 +834,37 @@ def parse_args(argv=None):
     g.add_argument("--tile", type=int, default=384, help="Tile size in the grid")
     g.add_argument("--cpu", action="store_true", help="Force LivePortrait onto the CPU")
 
-    g = p.add_argument_group("audio")
+    g = p.add_argument_group("audio (Opus through the translation server)")
     g.add_argument("--no-audio", action="store_true")
-    g.add_argument("--bandwidth", type=float, default=6.0,
-                   choices=[1.5, 3.0, 6.0, 12.0, 24.0],
-                   help="EnCodec target bandwidth in kbps")
-    g.add_argument("--audio-chunk-ms", type=int, default=240,
-                   help="Chunk length; lower means less latency and more overhead")
-    g.add_argument("--audio-device", default="cpu",
-                   help="Torch device for EnCodec ('cpu' keeps the GPU for rendering)")
+    g.add_argument("--translate-server", default=DEFAULT_SERVER, metavar="URL",
+                   help="Translation server's conference endpoint; all voice goes "
+                        "through it, translated or passed on untouched")
+    g.add_argument("--translate-token", default=os.environ.get("TRANSLATION_TOKEN"),
+                   help="Shared secret the server requires (or set TRANSLATION_TOKEN)")
+    g.add_argument("--opus-kbps", type=float, default=24.0,
+                   help="Opus bitrate of the voice you send")
+    g.add_argument("--voice-transport", choices=["rtc", "ws"], default="rtc",
+                   help="How voice reaches the server: `rtc` = WebRTC datachannel over "
+                        "UDP (falls back to the WebSocket if it can't connect), "
+                        "`ws` = WebSocket only")
+    g.add_argument("--speaks", default="en", metavar="LANG",
+                   help="Language you speak. Anyone who wants to hear it in that "
+                        "same language gets your voice untouched instead of "
+                        "translated")
     g.add_argument("--input-device", type=int, default=None)
     g.add_argument("--output-device", type=int, default=None)
     g.add_argument("--list-devices", action="store_true")
 
-    g = p.add_argument_group("translation (English speech, translated on the receiving side)")
-    g.add_argument("--translate", choices=sorted(LANGUAGES), default=None,
-                   help="Start the call hearing everyone in this language")
-    g.add_argument("--translate-langs", nargs="+", choices=sorted(LANGUAGES),
-                   default=["es", "fr"],
+    g = p.add_argument_group("translation (done by the server, per listener)")
+    g.add_argument("--translate", metavar="LANG", default=None,
+                   help="Start the call hearing everyone in this language "
+                        "(en, es, fr, de, it, ... any language the server speaks)")
+    g.add_argument("--translate-langs", nargs="+", metavar="LANG",
+                   default=["en", "es", "fr"],
                    help="Languages the T key cycles through, after off")
-    g.add_argument("--asr-model", default="small",
-                   help="faster-whisper model: tiny, base, small, small.en, medium, …")
-    g.add_argument("--mt-model", choices=["base", "big"], default="base",
-                   help="Opus-MT size; `big` (transformer-big, es/fr/it) is ~3x the "
-                        "download for a modest gain")
-    g.add_argument("--asr-device", choices=["auto", "cuda", "cpu"], default="auto",
-                   help="Where Whisper runs; the GPU cuts ~1.5 s of lag (default: GPU "
-                        "if there is one, unless --cpu)")
-    g.add_argument("--translate-threads", type=int, default=4,
-                   help="CPU threads for speech recognition")
-    g.add_argument("--tts", choices=["piper", "pocket"], default="piper",
-                   help="Speech synthesis engine for the translated voice: `piper` "
-                        "(one fixed voice per language) or `pocket` (Kyutai's "
-                        "Pocket TTS, voice-cloned from --voice-reference, runs on CPU)")
-    g.add_argument("--voice-reference", default=None,
-                   help="Wav file, named Pocket TTS voice (e.g. alba), or "
-                        "hf://kyutai/tts-voices/... path to clone — `--tts pocket` only "
-                        f"(default: the bundled voice '{DEFAULT_POCKET_VOICE}')")
-    g.add_argument("--pocket-device", choices=["auto", "cuda", "cpu"], default="auto",
-                   help="`--tts pocket` only; auto stays on CPU (GPU use is unofficial)")
-    g.add_argument("--pocket-quantize", action="store_true",
-                   help="`--tts pocket` only; int8 dynamic quantization on CPU "
-                        "(smaller/faster, same quality)")
 
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv)
-    if args.cpu and args.asr_device == "auto":
-        args.asr_device = "cpu"
     if args.translate and args.translate not in args.translate_langs:
         args.translate_langs.insert(0, args.translate)
     return args
