@@ -970,7 +970,7 @@ class LobbyDialog(QDialog):
                 lay.addLayout(ex_row)
         lay.addStretch(1)
 
-        self.preview_check = QCheckBox("Show my generated avatar during the call")
+        self.preview_check = QCheckBox("Show my self preview during the call")
         self.preview_check.setChecked(preview_self)
         self.preview_check.setCursor(Qt.PointingHandCursor)
         lay.addWidget(self.preview_check)

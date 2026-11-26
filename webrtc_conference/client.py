@@ -400,7 +400,7 @@ class ConferenceApp:
         if not enabled:
             self.self_preview = False
             self.self_motion.take()                 # drop anything still queued
-            self._notices.put("Self preview off — your camera is shown instead")
+            self._notices.put("Self preview off — others can still see you")
         elif self.self_renderer is not None:
             self.self_preview = True
             self._notices.put("Self preview on")
@@ -678,15 +678,20 @@ class ConferenceApp:
         if renderer is not None:
             subtitle += f"   self render {self._self_render_ms:.0f} ms"
 
-        if self.self_view == "avatar" and generated is not None:
+        if not self.self_preview:
+            # Off hides your video on this screen, camera included. Capture and
+            # sending carry on, so the tile stays for its name, stats and warnings.
+            image, inset, badge, inset_label = None, None, "", ""
+        elif self.self_view == "avatar" and generated is not None:
             image, inset = generated, camera
             badge, inset_label = "Generated · what others see", "camera"
         else:
             image, inset = camera, generated
-            badge, inset_label = ("Camera" if renderer is not None
-                                  else "Camera · self preview off"), "generated"
+            badge, inset_label = "Camera", "generated"
         if image is None:
             image, inset = inset, None
+            if image is None:
+                badge = ""
         badge_color = ui.ACCENT
         if status == "noface":
             badge, badge_color = "No face detected · not sending", ui.RED
@@ -695,11 +700,11 @@ class ConferenceApp:
             title=f"{self.args.name} (you)",
             image=image,
             subtitle=subtitle,
-            status="starting camera…",
+            status="starting camera…" if self.self_preview else "self preview off",
             accent=ui.GREEN if status == "ok" else ui.RED,
             inset=inset,
             inset_label=inset_label,
-            badge=badge if image is not None else "",
+            badge=badge,
             badge_color=badge_color,
         )
 
@@ -827,9 +832,10 @@ def parse_args(argv=None):
                         "rendered frame. Frees GPU time for the rest of the room at the "
                         "cost of that tile's own update rate. Cycle with D in the call.")
     g.add_argument("--preview-self", action=argparse.BooleanOptionalAction, default=None,
-                   help="Render your own avatar locally so you see what others see "
-                        "(costs one extra warp+decode per frame; toggle with P in the "
-                        "call; default: on, or your last lobby choice)")
+                   help="Show your own video: your avatar rendered locally so you see "
+                        "what others see (costs one extra warp+decode per frame), or "
+                        "your camera. Off hides both; others still see you. Toggle "
+                        "with P in the call; default: on, or your last lobby choice")
     g.add_argument("--avatar-quality", type=int, default=90)
     g.add_argument("--tile", type=int, default=384, help="Tile size in the grid")
     g.add_argument("--cpu", action="store_true", help="Force LivePortrait onto the CPU")

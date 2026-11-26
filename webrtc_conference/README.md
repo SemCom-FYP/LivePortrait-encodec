@@ -91,15 +91,16 @@ want to watch the mesh come up.
 Your own tile shows your **generated avatar** (rendered from your own motion
 vectors, exactly as the others see you) with your live camera as an inset;
 *Self view* (`v`) swaps the two. Rendering your own avatar costs one extra
-warp+decode per frame, so it can be switched off: untick *Show my generated
-avatar* in the lobby, press *Self preview* (`p`) during the call, or pass
-`--no-preview-self`. The lobby remembers the choice. The call window has
+warp+decode per frame. The self preview can be switched off, which hides both
+the avatar and your camera on your screen (others still see you): untick *Show my
+self preview* in the lobby, press *Self preview* (`p`) during the call, or pass
+`--no-preview-self`. The lobby remembers its own choice. The call window has
 clickable buttons for each of these, plus *Recalibrate*, *Snapshot* and
 *Leave*, with keyboard shortcuts:
 
 | key | action |
 |-----|--------|
-| `p` | turn the preview of your own generated avatar on/off |
+| `p` | turn your self preview (avatar and camera) on/off |
 | `v` | swap your tile between generated avatar and camera (while the preview is on) |
 | `q` / `Esc` | leave the call (closing the window also works) |
 | `r` | re-calibrate your neutral pose (do this while facing the camera straight on) |
@@ -109,7 +110,7 @@ clickable buttons for each of these, plus *Recalibrate*, *Snapshot* and
 Useful flags: `--fps` (motion vectors per second), `--bandwidth`
 (EnCodec kbps: 1.5/3/6/12/24), `--audio-chunk-ms` (latency vs. overhead),
 `--max-render-fps` (cap GPU spend per peer), `--no-preview-self`
-(skip rendering your own avatar to save GPU),
+(hide your self preview, which also saves GPU),
 `--no-audio`, `--list-devices`, `--cpu`.
 
 ### Hearing others translated

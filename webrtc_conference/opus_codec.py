@@ -54,7 +54,10 @@ class _RawOpus:
         self.opus_decoder_create = lib.opus_decoder_create
         self.opus_encode = lib.opus_encode
         self.opus_decode = lib.opus_decode
-        self.opus_encoder_ctl = lib.opus_encoder_ctl          # variadic: no argtypes
+        # Variadic, so no argtypes: wrap the handle, which ctypes would otherwise
+        # pass as a 32-bit int, truncating the pointer (segfault on 64-bit).
+        self.opus_encoder_ctl = lambda enc, request, value: lib.opus_encoder_ctl(
+            c.c_void_p(enc), request, value)
         self.opus_encoder_destroy = lib.opus_encoder_destroy
         self.opus_decoder_destroy = lib.opus_decoder_destroy
 
